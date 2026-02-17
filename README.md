@@ -64,13 +64,16 @@ SKYFLOW_CONCURRENCY=50
 # 1. First run — deploys all infra, creates table, runs benchmark
 ./run_benchmark.sh --rows 5000000 --unique-tokens 500000 --warehouse XL --iterations 2
 
-# 2. Re-run at a different scale (redeploy Lambda, recreate table)
+# 2. Change scale (reuse infra, recreate data only)
 ./run_benchmark.sh --rows 10000000 --unique-tokens 1000000 --warehouse XL --iterations 3 --skip-deploy
 
-# 3. Mock mode — pipeline only, no Skyflow
+# 3. Re-run same config (reuse everything)
+./run_benchmark.sh --rows 10000000 --unique-tokens 1000000 --warehouse XL --iterations 3 --skip-deploy --skip-setup
+
+# 4. Mock mode — pipeline only, no Skyflow
 ./run_benchmark.sh --rows 10000000 --mock --warehouse XL --skip-deploy
 
-# 4. Cleanup
+# 5. Cleanup
 ./run_benchmark.sh --cleanup
 ```
 
@@ -197,8 +200,8 @@ Batch Token Dedup Analysis (from 245 METRIC log lines):
 | `--unique-tokens N` | *(none)* | Custom unique token count for Skyflow seeding (overrides tier default) |
 | `--warehouse SIZE` | *(none)* | Warehouse size: XS, S, M, L, XL, 2XL, 3XL, 4XL (overrides tier) |
 | `--mock` | false | Force mock mode (ignore Skyflow config) |
-| `--skip-deploy` | false | Reuse existing AWS infra (Lambda, API Gateway) |
-| `--skip-setup` | false | Reuse existing Snowflake objects (warehouses, tables, functions) |
+| `--skip-deploy` | false | Reuse existing AWS and Snowflake infrastructure (Lambda, API Gateway, IAM, API integration, external functions, warehouses) |
+| `--skip-setup` | false | Reuse existing Snowflake data (tables, token seeding, results table) |
 | `--cleanup` | false | Tear down all resources and exit |
 | `--delay-ms MS` | 0 | Simulated API latency in Lambda (milliseconds) |
 | `--iterations N` | 3 | Measured runs per warehouse/table combo |
@@ -212,7 +215,7 @@ Batch Token Dedup Analysis (from 245 METRIC log lines):
 
 ## Usage
 
-Use `--rows` and `--unique-tokens` to run at any scale. Deploy once, then iterate with `--skip-deploy` (reuse AWS infra). Use `--skip-setup` to reuse existing Snowflake tables (note: `--rows` has no effect with `--skip-setup` since the table isn't recreated).
+Use `--rows` and `--unique-tokens` to run at any scale. Deploy once, then use `--skip-deploy` to reuse all infrastructure (AWS + Snowflake) while recreating data at a new scale. Add `--skip-setup` to also skip data setup and reuse existing tables.
 
 ```bash
 # Mock with simulated latency
@@ -238,6 +241,7 @@ Lambda invocations ≈ `total_rows / batch_size`. Snowflake dynamically sizes ba
 
 1. **Preflight checks** — validates AWS, SnowSQL, Go, jq
 2. **AWS deployment** — builds Lambda, creates API Gateway, configures IAM (skipped with `--skip-deploy`)
-3. **Snowflake setup** — creates warehouses, tables, seeds token data, creates external functions (skipped with `--skip-setup`)
+3a. **Snowflake infrastructure** — creates database, API integration, external functions, warehouses (skipped with `--skip-deploy`)
+3b. **Snowflake data setup** — generates tables, seeds tokens, creates results table, runs smoke test (skipped with `--skip-setup`)
 4. **Benchmarks** — runs the test matrix with warmup + measured iterations
 5. **Results** — pipeline analysis table, CloudWatch metrics, stored in `EXT_FUNC_BENCHMARK.BENCHMARK.benchmark_results`

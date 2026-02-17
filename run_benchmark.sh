@@ -135,8 +135,8 @@ while [[ $# -gt 0 ]]; do
       echo "Usage: $0 [options]"
       echo "  All credentials and IDs are read from benchmark.conf"
       echo ""
-      echo "  --skip-deploy          Reuse existing AWS infrastructure"
-      echo "  --skip-setup           Reuse existing Snowflake objects"
+      echo "  --skip-deploy          Reuse existing AWS and Snowflake infrastructure (Lambda, API Gateway, IAM, API integration, external functions, warehouses)"
+      echo "  --skip-setup           Reuse existing Snowflake data (tables, token seeding, results table)"
       echo "  --cleanup              Tear down everything and exit"
       echo "  --delay-ms MS          Simulated API latency in Lambda (default: 0)"
       echo "  --quick                Reduced test matrix (XL x 10M/100M x 3 iters)"
@@ -772,15 +772,15 @@ fi
 echo ""
 
 ###############################################################################
-# Phase 3: Configure Snowflake
+# Phase 3a: Snowflake Infrastructure
 ###############################################################################
-if $SKIP_SETUP; then
-  log "PHASE 3: Skipping Snowflake setup (--skip-setup)"
-  if [[ -n "$CUSTOM_ROWS" ]]; then
-    warn "--rows specified with --skip-setup: table test_tokens_custom must already exist"
-  fi
+FUNC_PREFIX="${SF_DB}.${SF_SCHEMA}"
+INTEGRATION_NAME="${SF_PREFIX}_api_integration"
+
+if $SKIP_DEPLOY; then
+  log "PHASE 3a: Skipping Snowflake infrastructure (--skip-deploy)"
 else
-  log "PHASE 3: Configuring Snowflake"
+  log "PHASE 3a: Configuring Snowflake infrastructure"
 
   # ── Database and schema ──
   snow_sql_silent "CREATE DATABASE IF NOT EXISTS ${SF_DB}"
@@ -789,7 +789,6 @@ else
 
   # ── API Integration ──
   log "Creating API integration..."
-  INTEGRATION_NAME="${SF_PREFIX}_api_integration"
 
   # Snowflake replaces hyphens — use underscores in the integration name
   snow_sql_silent "CREATE OR REPLACE API INTEGRATION ${INTEGRATION_NAME}
@@ -886,8 +885,6 @@ TRUST
   # ── External functions ──
   log "Creating external functions..."
 
-  FUNC_PREFIX="${SF_DB}.${SF_SCHEMA}"
-
   # Default mock function (backward compatible — always created)
   snow_sql_silent "CREATE OR REPLACE EXTERNAL FUNCTION ${FUNC_PREFIX}.benchmark_detokenize_default(token_value VARCHAR)
     RETURNS VARIANT
@@ -928,8 +925,20 @@ TRUST
       INITIALLY_SUSPENDED = TRUE"
     ok "Warehouse: ${wh} (${size})"
   done
+fi
 
-  # ── Test data (use 2XL if available, else XL, else largest WH for speed) ──
+###############################################################################
+# Phase 3b: Snowflake Data Setup
+###############################################################################
+if $SKIP_SETUP; then
+  log "PHASE 3b: Skipping Snowflake data setup (--skip-setup)"
+  if [[ -n "$CUSTOM_ROWS" ]]; then
+    warn "--rows specified with --skip-setup: table test_tokens_custom must already exist"
+  fi
+else
+  log "PHASE 3b: Setting up Snowflake data"
+
+  # ── Select largest warehouse for data generation ──
   DATA_GEN_WH=""
   for candidate in BENCH_4XL BENCH_3XL BENCH_2XL BENCH_XL BENCH_L BENCH_M BENCH_S BENCH_XS; do
     for wh in "${ALL_WAREHOUSES[@]}"; do
@@ -1107,8 +1116,6 @@ echo ""
 MODE_LABEL="mock"
 if $SKYFLOW_MODE; then MODE_LABEL="skyflow"; fi
 log "PHASE 4: Running benchmarks (mode=${MODE_LABEL}, delay=${DELAY_MS}ms, iterations=${ITERATIONS})"
-
-FUNC_PREFIX="${SF_DB}.${SF_SCHEMA}"
 
 # ── Track benchmark time window for CloudWatch log fetching ──
 BENCH_EARLIEST_START=""
@@ -1445,7 +1452,7 @@ else
   printf "%-8s | %-18s | %-9s | %8s | %8s | %10s | %s\n" \
     "WH" "TABLE" "ITER" "WALL_MS" "SF_MS" "SF_RPS" "PHASE"
   printf "%s\n" \
-    "---------|--------------------|-----------|---------|---------+------------|----------"
+    "---------|--------------------|-----------|---------|---------|------------|----------"
 
   for entry in "${MATRIX[@]}"; do
     IFS='|' read -r wh tbl <<< "$entry"
@@ -1548,12 +1555,12 @@ snow_sql "WITH stats AS (
   )
   SELECT
     row_count AS num_rows,
-    MAX(CASE WHEN warehouse_name = 'BENCH_XS' THEN ROUND(median_rps, 0) END) AS XS,
-    MAX(CASE WHEN warehouse_name = 'BENCH_M' THEN ROUND(median_rps, 0) END) AS M,
-    MAX(CASE WHEN warehouse_name = 'BENCH_XL' THEN ROUND(median_rps, 0) END) AS XL,
-    MAX(CASE WHEN warehouse_name = 'BENCH_2XL' THEN ROUND(median_rps, 0) END) AS XXL,
-    MAX(CASE WHEN warehouse_name = 'BENCH_3XL' THEN ROUND(median_rps, 0) END) AS XXXL,
-    MAX(CASE WHEN warehouse_name = 'BENCH_4XL' THEN ROUND(median_rps, 0) END) AS XXXXL
+    COALESCE(TO_VARCHAR(MAX(CASE WHEN warehouse_name = 'BENCH_XS' THEN ROUND(median_rps, 0) END)), '-') AS XS,
+    COALESCE(TO_VARCHAR(MAX(CASE WHEN warehouse_name = 'BENCH_M' THEN ROUND(median_rps, 0) END)), '-') AS M,
+    COALESCE(TO_VARCHAR(MAX(CASE WHEN warehouse_name = 'BENCH_XL' THEN ROUND(median_rps, 0) END)), '-') AS XL,
+    COALESCE(TO_VARCHAR(MAX(CASE WHEN warehouse_name = 'BENCH_2XL' THEN ROUND(median_rps, 0) END)), '-') AS XXL,
+    COALESCE(TO_VARCHAR(MAX(CASE WHEN warehouse_name = 'BENCH_3XL' THEN ROUND(median_rps, 0) END)), '-') AS XXXL,
+    COALESCE(TO_VARCHAR(MAX(CASE WHEN warehouse_name = 'BENCH_4XL' THEN ROUND(median_rps, 0) END)), '-') AS XXXXL
   FROM stats
   GROUP BY row_count
   ORDER BY row_count"
@@ -1638,6 +1645,7 @@ print(int((dt.timestamp() + 120) * 1000))
   ok "Fetched ${METRIC_LINE_COUNT} METRIC log lines"
 
   # ── Parse METRIC logs per query and build pipeline analysis ──
+  echo ""
   log "=== Snowflake → Lambda Pipeline Analysis ==="
   echo ""
   printf "%-10s | %-14s | %-8s | %11s | %9s | %9s | %9s | %10s | %10s | %10s | %8s\n" \
@@ -1808,11 +1816,8 @@ print(int((dt.timestamp() + 120) * 1000))
     DEDUP_AVG_PCT=$(echo "$DEDUP_STATS" | awk '{print $5}')
 
     if [[ "$DEDUP_N" -gt 0 ]]; then
-      log "Batch Token Dedup Analysis (from ${DEDUP_N} METRIC log lines):"
-      printf "  Avg batch size:         %s\n" "$DEDUP_AVG_BS"
-      printf "  Avg unique tokens:      %s\n" "$DEDUP_AVG_UT"
-      printf "  Avg repeated tokens:    %s\n" "$DEDUP_AVG_REP"
-      printf "  Avg dedup %%:            %s%%\n" "$DEDUP_AVG_PCT"
+      printf "  Batch dedup (%s samples): avg_batch=%s  unique=%s  repeated=%s  dedup=%s%%\n" \
+        "$DEDUP_N" "$DEDUP_AVG_BS" "$DEDUP_AVG_UT" "$DEDUP_AVG_REP" "$DEDUP_AVG_PCT"
       echo ""
     else
       warn "No METRIC lines with unique_tokens found in CloudWatch logs"
@@ -1831,47 +1836,60 @@ log "CloudWatch Lambda Metrics (last 60 minutes):"
 END_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || gdate -u +%Y-%m-%dT%H:%M:%SZ)
 START_TIME=$(date -u -v-60M +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || gdate -u -d '60 minutes ago' +%Y-%m-%dT%H:%M:%SZ)
 
-echo "  Peak concurrent executions:"
-aws_ cloudwatch get-metric-statistics \
-  --namespace AWS/Lambda \
-  --metric-name ConcurrentExecutions \
+# Fetch all three metrics as JSON
+CW_CONCURRENT=$(aws_ cloudwatch get-metric-statistics \
+  --namespace AWS/Lambda --metric-name ConcurrentExecutions \
   --dimensions Name=FunctionName,Value="${LAMBDA_NAME}" \
-  --start-time "$START_TIME" \
-  --end-time "$END_TIME" \
-  --period 60 \
-  --statistics Maximum \
-  --query 'sort_by(Datapoints, &Timestamp)[-10:].{Time:Timestamp,Max:Maximum}' \
-  --output table 2>/dev/null || warn "Could not fetch ConcurrentExecutions metric"
+  --start-time "$START_TIME" --end-time "$END_TIME" \
+  --period 60 --statistics Maximum --output json 2>/dev/null || echo '{"Datapoints":[]}')
+
+CW_INVOCATIONS=$(aws_ cloudwatch get-metric-statistics \
+  --namespace AWS/Lambda --metric-name Invocations \
+  --dimensions Name=FunctionName,Value="${LAMBDA_NAME}" \
+  --start-time "$START_TIME" --end-time "$END_TIME" \
+  --period 60 --statistics Sum --output json 2>/dev/null || echo '{"Datapoints":[]}')
+
+CW_THROTTLES=$(aws_ cloudwatch get-metric-statistics \
+  --namespace AWS/Lambda --metric-name Throttles \
+  --dimensions Name=FunctionName,Value="${LAMBDA_NAME}" \
+  --start-time "$START_TIME" --end-time "$END_TIME" \
+  --period 60 --statistics Sum --output json 2>/dev/null || echo '{"Datapoints":[]}')
+
+# Merge and format into a compact table
+CW_TABLE=$(jq -r -n \
+  --argjson c "$CW_CONCURRENT" \
+  --argjson i "$CW_INVOCATIONS" \
+  --argjson t "$CW_THROTTLES" '
+  # Collect all timestamps
+  ([$c.Datapoints[].Timestamp, $i.Datapoints[].Timestamp, $t.Datapoints[].Timestamp] | unique) as $times |
+  # Build lookup maps
+  ($c.Datapoints | map({(.Timestamp): .Maximum}) | add // {}) as $cmap |
+  ($i.Datapoints | map({(.Timestamp): .Sum}) | add // {}) as $imap |
+  ($t.Datapoints | map({(.Timestamp): .Sum}) | add // {}) as $tmap |
+  # Sort and output last 10 rows
+  ($times | sort | .[-10:])[] |
+  . as $ts |
+  ($ts | split("T")[1] | split(":")[0:2] | join(":")) as $hm |
+  "\($hm)\t\($cmap[$ts] // "-" | tostring | split(".")[0])\t\($imap[$ts] // "-" | tostring | split(".")[0])\t\($tmap[$ts] // "-" | tostring | split(".")[0])"
+' 2>/dev/null)
+
+if [[ -n "$CW_TABLE" ]]; then
+  printf "  %-18s| %10s | %12s | %9s\n" "TIME (UTC)" "CONCURRENT" "INVOCATIONS" "THROTTLES"
+  printf "  %-18s|%s|%s|%s\n" "------------------" "------------" "--------------" "-----------"
+  while IFS=$'\t' read -r hm conc inv thr; do
+    printf "  %-18s| %10s | %12s | %9s\n" "$hm" "$conc" "$inv" "$thr"
+  done <<< "$CW_TABLE"
+else
+  warn "No CloudWatch metric data available"
+fi
 
 echo ""
-echo "  Invocations per minute:"
-aws_ cloudwatch get-metric-statistics \
-  --namespace AWS/Lambda \
-  --metric-name Invocations \
-  --dimensions Name=FunctionName,Value="${LAMBDA_NAME}" \
-  --start-time "$START_TIME" \
-  --end-time "$END_TIME" \
-  --period 60 \
-  --statistics Sum \
-  --query 'sort_by(Datapoints, &Timestamp)[-10:].{Time:Timestamp,Count:Sum}' \
-  --output table 2>/dev/null || warn "Could not fetch Invocations metric"
-
-echo ""
-echo "  Throttles:"
-aws_ cloudwatch get-metric-statistics \
-  --namespace AWS/Lambda \
-  --metric-name Throttles \
-  --dimensions Name=FunctionName,Value="${LAMBDA_NAME}" \
-  --start-time "$START_TIME" \
-  --end-time "$END_TIME" \
-  --period 60 \
-  --statistics Sum \
-  --query 'sort_by(Datapoints, &Timestamp)[-10:].{Time:Timestamp,Throttles:Sum}' \
-  --output table 2>/dev/null || warn "Could not fetch Throttles metric"
-
-echo ""
+log "──────────────────────────────────────────────────"
 log "Benchmark complete!"
-log "Results stored in: ${SF_DB}.${SF_SCHEMA}.benchmark_results"
-log "Lambda metrics in CloudWatch: /aws/lambda/${LAMBDA_NAME}"
-log "To re-run with existing infra: $0 --skip-deploy --skip-setup"
-log "To clean up: $0 --cleanup"
+log "Results: ${SF_DB}.${SF_SCHEMA}.benchmark_results"
+log "Logs:    /aws/lambda/${LAMBDA_NAME}"
+echo ""
+log "Next run:"
+log "  Change scale:  $0 --skip-deploy --rows N --unique-tokens N ..."
+log "  Same config:   $0 --skip-deploy --skip-setup"
+log "  Cleanup:       $0 --cleanup"
