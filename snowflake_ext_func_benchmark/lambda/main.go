@@ -5,23 +5,18 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"os"
-	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
-	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
-	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 )
 
 var (
-	ddbClient       *dynamodb.Client
-	tableName       string
 	simulatedDelay  time.Duration
 	invocationCount atomic.Int64
+	skyflowClient   *SkyflowClient
 )
 
 type sfRequest struct {
@@ -32,52 +27,42 @@ type sfResponse struct {
 	Data [][]interface{} `json:"data"`
 }
 
-type metricRecord struct {
-	QueryID            string `dynamodbav:"query_id"`
-	SortKey            string `dynamodbav:"sk"`
-	BatchID            string `dynamodbav:"batch_id"`
-	BatchSize          int    `dynamodbav:"batch_size"`
-	ReceiveTimestampNs int64  `dynamodbav:"receive_timestamp_ns"`
-	ProcessingDurNs    int64  `dynamodbav:"processing_duration_ns"`
-	BenchmarkConfig    string `dynamodbav:"benchmark_config"`
-	InvocationNum      int64  `dynamodbav:"invocation_num"`
-	LambdaInstanceID   string `dynamodbav:"lambda_instance_id"`
-}
-
 var lambdaInstanceID string
 
 func init() {
 	lambdaInstanceID = fmt.Sprintf("%d", time.Now().UnixNano())
 
-	tableName = os.Getenv("DYNAMODB_TABLE")
-	if tableName == "" {
-		tableName = "ext_func_benchmark_metrics"
+	// Initialize Skyflow client (nil if SKYFLOW_DATA_PLANE_URL not set → mock mode)
+	skyflowCfg := loadSkyflowConfig()
+	if skyflowCfg != nil {
+		skyflowClient = NewSkyflowClient(*skyflowCfg)
+		log.Printf("INFO: Skyflow mode enabled (url=%s, vault=%s, batch=%d, concurrency=%d)",
+			skyflowCfg.DataPlaneURL, skyflowCfg.VaultID, skyflowCfg.BatchSize, skyflowCfg.MaxConcurrency)
+	} else {
+		log.Printf("INFO: Mock mode (SKYFLOW_DATA_PLANE_URL not set)")
 	}
-
-	delayStr := os.Getenv("SIMULATED_DELAY_MS")
-	if delayStr != "" {
-		ms, err := strconv.Atoi(delayStr)
-		if err == nil && ms > 0 {
-			simulatedDelay = time.Duration(ms) * time.Millisecond
-		}
-	}
-
-	cfg, err := config.LoadDefaultConfig(context.Background())
-	if err != nil {
-		log.Printf("WARN: failed to load AWS config for DynamoDB: %v", err)
-		return
-	}
-	ddbClient = dynamodb.NewFromConfig(cfg)
 }
 
 func handler(ctx context.Context, req events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
 	receiveTs := time.Now().UnixNano()
 	invNum := invocationCount.Add(1)
 
-	// Extract Snowflake headers
-	queryID := req.Headers["sf-external-function-current-query-id"]
-	batchID := req.Headers["sf-external-function-query-batch-id"]
-	benchConfig := req.Headers["sf-benchmark-config"]
+	// Normalize headers to lowercase (HTTP headers are case-insensitive,
+	// but Go maps are case-sensitive. Snowflake/API Gateway may vary casing.)
+	lowerHeaders := make(map[string]string, len(req.Headers))
+	for k, v := range req.Headers {
+		lowerHeaders[strings.ToLower(k)] = v
+	}
+
+	// Extract Snowflake headers (Snowflake prepends "sf-custom-" to custom headers)
+	queryID := lowerHeaders["sf-external-function-current-query-id"]
+	batchID := lowerHeaders["sf-external-function-query-batch-id"]
+	benchConfig := lowerHeaders["sf-benchmark-config"]
+	operation := lowerHeaders["sf-custom-x-operation"]
+	if operation == "" {
+		operation = "detokenize" // backward compatible
+	}
+	operation = strings.ToLower(operation)
 
 	if queryID == "" {
 		queryID = "unknown"
@@ -101,56 +86,66 @@ func handler(ctx context.Context, req events.APIGatewayProxyRequest) (events.API
 
 	batchSize := len(sfReq.Data)
 
-	// Simulate API latency
-	if simulatedDelay > 0 {
-		time.Sleep(simulatedDelay)
-	}
-
-	// Build response: prepend DETOK_ to each token value
-	resp := sfResponse{Data: make([][]interface{}, batchSize)}
-	for i, row := range sfReq.Data {
-		if len(row) < 2 {
-			resp.Data[i] = []interface{}{i, "DETOK_ERROR_MISSING_VALUE"}
-			continue
+	// Determine mode and build response
+	mode := "mock"
+	var resp sfResponse
+	var skyflowM *SkyflowMetrics
+	if skyflowClient != nil {
+		mode = "skyflow"
+		var respData [][]interface{}
+		var skyflowErr error
+		switch operation {
+		case "tokenize":
+			respData, skyflowM, skyflowErr = skyflowClient.Tokenize(ctx, sfReq.Data)
+		case "detokenize":
+			respData, skyflowM, skyflowErr = skyflowClient.Detokenize(ctx, sfReq.Data)
+		default:
+			return events.APIGatewayProxyResponse{
+				StatusCode: 400,
+				Body:       fmt.Sprintf(`{"error": "unknown operation: %s"}`, operation),
+			}, nil
 		}
-		rowNum := row[0]
-		tokenVal := fmt.Sprintf("%v", row[1])
-		resp.Data[i] = []interface{}{rowNum, "DETOK_" + tokenVal}
+		if skyflowErr != nil {
+			log.Printf("ERROR: Skyflow %s failed: %v", operation, skyflowErr)
+			return events.APIGatewayProxyResponse{
+				StatusCode: 500,
+				Body:       fmt.Sprintf(`{"error": "skyflow %s failed: %v"}`, operation, skyflowErr),
+			}, nil
+		}
+		resp = sfResponse{Data: respData}
+	} else {
+		// Mock mode: simulated delay + DETOK_ prefix
+		if simulatedDelay > 0 {
+			time.Sleep(simulatedDelay)
+		}
+		resp = sfResponse{Data: make([][]interface{}, batchSize)}
+		for i, row := range sfReq.Data {
+			if len(row) < 2 {
+				resp.Data[i] = []interface{}{i, "DETOK_ERROR_MISSING_VALUE"}
+				continue
+			}
+			rowNum := row[0]
+			tokenVal := fmt.Sprintf("%v", row[1])
+			resp.Data[i] = []interface{}{rowNum, "DETOK_" + tokenVal}
+		}
 	}
 
 	processingDur := time.Now().UnixNano() - receiveTs
 
-	// Log to CloudWatch (synchronous, cheap)
-	log.Printf("METRIC query_id=%s batch_id=%s batch_size=%d config=%s duration_ns=%d invocation=%d instance=%s",
-		queryID, batchID, batchSize, benchConfig, processingDur, invNum, lambdaInstanceID)
-
-	// Synchronous DynamoDB write — ensures metrics land before Lambda freezes.
-	// Adds ~5ms per invocation (acceptable for benchmark accuracy).
-	if ddbClient != nil {
-		record := metricRecord{
-			QueryID:            queryID,
-			SortKey:            fmt.Sprintf("%s#%d", batchID, receiveTs),
-			BatchID:            batchID,
-			BatchSize:          batchSize,
-			ReceiveTimestampNs: receiveTs,
-			ProcessingDurNs:    processingDur,
-			BenchmarkConfig:    benchConfig,
-			InvocationNum:      invNum,
-			LambdaInstanceID:   lambdaInstanceID,
-		}
-		item, err := attributevalue.MarshalMap(record)
-		if err != nil {
-			log.Printf("WARN: failed to marshal DynamoDB item: %v", err)
-		} else {
-			tbl := tableName
-			_, err = ddbClient.PutItem(context.Background(), &dynamodb.PutItemInput{
-				TableName: &tbl,
-				Item:      item,
-			})
-			if err != nil {
-				log.Printf("WARN: failed to write to DynamoDB: %v", err)
-			}
-		}
+	// Log to CloudWatch
+	if skyflowM != nil {
+		lambdaOverheadMs := processingDur/1e6 - skyflowM.SkyflowWallMs
+		log.Printf("METRIC query_id=%s batch_id=%s batch_size=%d operation=%s mode=%s duration_ms=%d "+
+			"unique_tokens=%d dedup_pct=%.1f skyflow_calls=%d skyflow_wall_ms=%d "+
+			"call_min_ms=%d call_avg_ms=%d call_max_ms=%d lambda_overhead_ms=%d errors=%d "+
+			"invocation=%d instance=%s config=%s",
+			queryID, batchID, batchSize, operation, mode, processingDur/1e6,
+			skyflowM.UniqueTokens, skyflowM.DedupPct, skyflowM.SkyflowCalls, skyflowM.SkyflowWallMs,
+			skyflowM.CallMinMs, skyflowM.CallAvgMs, skyflowM.CallMaxMs, lambdaOverheadMs, skyflowM.Errors,
+			invNum, lambdaInstanceID, benchConfig)
+	} else {
+		log.Printf("METRIC query_id=%s batch_id=%s batch_size=%d operation=%s mode=%s duration_ms=%d invocation=%d instance=%s config=%s",
+			queryID, batchID, batchSize, operation, mode, processingDur/1e6, invNum, lambdaInstanceID, benchConfig)
 	}
 
 	respBody, err := json.Marshal(resp)
