@@ -1081,12 +1081,14 @@ else
       fi
     fi
 
-    # Also verify mock function works
-    SMOKE_MOCK=$(snow_sql "SELECT ${FUNC_PREFIX}.benchmark_detokenize_default('test-token-123') AS result" 2>&1 || true)
-    if echo "$SMOKE_MOCK" | grep -qi "DETOK_"; then
-      ok "Smoke test: mock function also working"
-    else
-      warn "Mock function smoke test returned unexpected result"
+    # Also verify mock function works (skip in Skyflow mode — Lambda has no mock path when skyflowClient is set)
+    if ! $SKYFLOW_MODE; then
+      SMOKE_MOCK=$(snow_sql "SELECT ${FUNC_PREFIX}.benchmark_detokenize_default('test-token-123') AS result" 2>&1 || true)
+      if echo "$SMOKE_MOCK" | grep -qi "DETOK_"; then
+        ok "Smoke test: mock function also working"
+      else
+        warn "Mock function smoke test returned unexpected result"
+      fi
     fi
   else
     # Mock mode smoke test
