@@ -54,7 +54,7 @@ MICRO=false
 MEDIUM=false
 INSTALL_PREREQS=false
 ITERATIONS="${ITERATIONS:-3}"
-CONCURRENCY="${CONCURRENCY:-2900}"
+CONCURRENCY="${CONCURRENCY:-4900}"
 VALIDATE_10B=false
 FORCE_MOCK=false
 PROBE=false
@@ -142,7 +142,7 @@ while [[ $# -gt 0 ]]; do
       echo "  --micro                Small test matrix (XL x 1K/10K/100K x 1 iter, 25K seeds)"
       echo "  --install-prereqs      Install missing prerequisites via Homebrew/pip"
       echo "  --iterations N         Measured runs per combo (default: 3)"
-      echo "  --concurrency N        Lambda reserved concurrency (default: 2900)"
+      echo "  --concurrency N        Lambda reserved concurrency (default: 4900)"
       echo "  --validate-10b         Append XL/2XL x 10B x 1 iteration after main matrix"
       echo "  --mock                 Force mock mode (ignore Skyflow config)"
       echo "  --rows N               Custom table with N rows (overrides tier table selection)"

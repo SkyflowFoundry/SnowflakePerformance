@@ -149,7 +149,7 @@ sequenceDiagram
 | `--cleanup` | false | Tear down all resources and exit |
 | `--delay-ms MS` | 0 | Simulated API latency in Lambda (milliseconds) |
 | `--iterations N` | 3 | Measured runs per warehouse/table combo |
-| `--concurrency N` | 2900 | Lambda reserved concurrency limit |
+| `--concurrency N` | 4900 | Lambda reserved concurrency limit |
 | `--install-prereqs` | false | Install missing prerequisites via Homebrew/pip |
 | `--validate-10b` | false | Append XL/2XL x 10B validation after main matrix |
 | `--probe` | false | Pipeline fundamentals (mock-only, CloudWatch concurrency polling) |
