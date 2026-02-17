@@ -149,6 +149,75 @@ The script runs in 5 phases:
 - **CloudWatch metrics**: peak concurrent executions, invocations/min, throttles over last 60 min
 - **Snowflake results table**: `EXT_FUNC_BENCHMARK.BENCHMARK.benchmark_results`
 
+## Scaling Examples
+
+The benchmark generates Snowflake tables with N total rows. In Skyflow mode, a pool of unique tokens is seeded and cycled across rows via `MOD(id, seed_count)`, so each Lambda batch (4,096 rows) contains a mix of duplicates and unique tokens. The dedup ratio controls how many actual Skyflow API calls are needed per batch.
+
+Below are example runs at different scales. All assume infra is already deployed (`--skip-deploy --skip-setup`).
+
+### Smoke test — 100K rows, 10K unique tokens
+
+```bash
+# 100K total rows, 10K unique tokens (10% unique, 90% dedup)
+# ~25 Lambda invocations, completes in seconds
+./run_benchmark.sh --micro --skip-deploy --skip-setup
+```
+
+### Small — 1M rows, 250K unique tokens
+
+```bash
+# 1M total rows, 250K unique Skyflow tokens (25% unique)
+# ~244 Lambda invocations
+./run_benchmark.sh --medium --skip-deploy --skip-setup
+```
+
+### Medium — 10M rows, 2.5M unique tokens
+
+```bash
+# 10M total rows, 2.5M unique Skyflow tokens (25% unique)
+# ~2,442 Lambda invocations, exercises concurrency scaling
+./run_benchmark.sh --medium --skip-deploy --skip-setup
+```
+
+### Large — 100M rows, 25M unique tokens
+
+```bash
+# 100M total rows, 25M unique tokens (25% unique)
+# ~24,415 Lambda invocations, full warehouse concurrency
+./run_benchmark.sh --quick --skip-deploy --skip-setup
+```
+
+### XL — 1B rows, 100M unique tokens
+
+```bash
+# 1B total rows, 100M unique tokens (10% unique)
+# ~244,141 Lambda invocations, tests sustained throughput
+# Uses XS/M/XL/2XL warehouses, 3 iterations each
+./run_benchmark.sh --skip-deploy --skip-setup
+```
+
+### Max — 10B rows, 500M unique tokens
+
+```bash
+# 10B total rows, 500M unique tokens (5% unique)
+# ~2.4M Lambda invocations, extreme scale validation
+# Requires --validate-10b flag and XL/2XL warehouses
+./run_benchmark.sh --validate-10b --skip-deploy --skip-setup
+```
+
+### Scale reference
+
+| Total Rows | Unique Tokens | Dedup % | Lambda Invocations | Preset |
+| ---------- | ------------- | ------- | ------------------ | ------ |
+| 100K | 10K | 90% | ~25 | `--micro` |
+| 1M | 250K | 75% | ~244 | `--medium` |
+| 10M | 2.5M | 75% | ~2,442 | `--medium` |
+| 100M | 25M | 75% | ~24,415 | `--quick` |
+| 1B | 100M | 90% | ~244,141 | *(default)* |
+| 10B | 500M | 95% | ~2,441,407 | `--validate-10b` |
+
+Lambda invocations = `ceil(total_rows / 4,096)`. Actual Skyflow API calls per invocation depend on `SKYFLOW_BATCH_SIZE`, `SKYFLOW_CONCURRENCY`, and the dedup ratio within each 4,096-row batch.
+
 ## Iterative Testing
 
 Deploy once, then iterate:
