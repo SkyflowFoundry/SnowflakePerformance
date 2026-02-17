@@ -60,6 +60,7 @@ FORCE_MOCK=false
 PROBE=false
 CUSTOM_ROWS="${CUSTOM_ROWS:-}"
 CUSTOM_UNIQUE_TOKENS="${CUSTOM_UNIQUE_TOKENS:-}"
+CUSTOM_WAREHOUSE="${CUSTOM_WAREHOUSE:-}"
 
 # Resource naming
 # AWS resources use hyphens, Snowflake uses underscores (SF rejects hyphens in identifiers)
@@ -129,6 +130,7 @@ while [[ $# -gt 0 ]]; do
     --probe)               PROBE=true; shift ;;
     --rows)            CUSTOM_ROWS="$2"; shift 2 ;;
     --unique-tokens)   CUSTOM_UNIQUE_TOKENS="$2"; shift 2 ;;
+    --warehouse)       CUSTOM_WAREHOUSE="$2"; shift 2 ;;
     -h|--help)
       echo "Usage: $0 [options]"
       echo "  All credentials and IDs are read from benchmark.conf"
@@ -147,6 +149,7 @@ while [[ $# -gt 0 ]]; do
       echo "  --mock                 Force mock mode (ignore Skyflow config)"
       echo "  --rows N               Custom table with N rows (overrides tier table selection)"
       echo "  --unique-tokens N      Custom unique token count for Skyflow seeding (overrides tier default)"
+      echo "  --warehouse SIZE       Warehouse size: XS, S, M, L, XL, 2XL, 3XL, 4XL (overrides tier)"
       echo "  --probe                Probe mode: measure pipeline fundamentals (batch size,"
       echo "                         concurrency, throughput) with mock-only, time-bounded tests"
       exit 0
@@ -174,6 +177,21 @@ elif $MEDIUM; then
 elif $QUICK; then
   ALL_WAREHOUSES=(BENCH_XL)
   ALL_TABLES=(test_tokens_10m test_tokens_100m)
+fi
+
+# Custom warehouse override (--warehouse SIZE)
+if [[ -n "$CUSTOM_WAREHOUSE" ]]; then
+  case "$CUSTOM_WAREHOUSE" in
+    XS)  ALL_WAREHOUSES=(BENCH_XS) ;;
+    S)   ALL_WAREHOUSES=(BENCH_S) ;;
+    M)   ALL_WAREHOUSES=(BENCH_M) ;;
+    L)   ALL_WAREHOUSES=(BENCH_L) ;;
+    XL)  ALL_WAREHOUSES=(BENCH_XL) ;;
+    2XL) ALL_WAREHOUSES=(BENCH_2XL) ;;
+    3XL) ALL_WAREHOUSES=(BENCH_3XL) ;;
+    4XL) ALL_WAREHOUSES=(BENCH_4XL) ;;
+    *)   echo "ERROR: --warehouse must be one of: XS, S, M, L, XL, 2XL, 3XL, 4XL"; exit 1 ;;
+  esac
 fi
 
 # Custom rows override (--rows N)

@@ -143,6 +143,7 @@ sequenceDiagram
 | ---- | ------- | ----------- |
 | `--rows N` | *(none)* | Custom table with N rows (overrides tier table selection) |
 | `--unique-tokens N` | *(none)* | Custom unique token count for Skyflow seeding (overrides tier default) |
+| `--warehouse SIZE` | *(none)* | Warehouse size: XS, S, M, L, XL, 2XL, 3XL, 4XL (overrides tier) |
 | `--mock` | false | Force mock mode (ignore Skyflow config) |
 | `--skip-deploy` | false | Reuse existing AWS infra (Lambda, API Gateway) |
 | `--skip-setup` | false | Reuse existing Snowflake objects (warehouses, tables, functions) |
