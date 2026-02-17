@@ -4,7 +4,7 @@ Measures how Snowflake batches and parallelizes external function calls to deter
 
 ## What This Measures
 
-- **Batch size**: How many rows does Snowflake send per Lambda invocation? (confirmed: 4,096)
+- **Batch size**: How many rows does Snowflake send per Lambda invocation? (dynamic: ~190 at 0ms latency, up to ~4,096 at high latency)
 - **Concurrency**: How many Lambdas does Snowflake run in parallel per warehouse size?
 - **Throughput**: Raw rows/sec at each warehouse size, table size, and latency profile
 - **Warehouse scaling**: Does bigger warehouse = more external function parallelism?
@@ -55,10 +55,8 @@ SKYFLOW_CONCURRENCY=50
 | `SKYFLOW_ACCOUNT_ID` | Skyflow account ID for API authentication |
 | `SKYFLOW_TABLE` | Skyflow vault table name to tokenize/detokenize against |
 | `SKYFLOW_COLUMN` | Skyflow vault column name for the token field |
-| `SKYFLOW_BATCH_SIZE` | Number of tokens per Skyflow API call. The Lambda batches tokens from each Snowflake batch (4,096 rows) into sub-batches of this size |
+| `SKYFLOW_BATCH_SIZE` | Number of tokens per Skyflow API call. The Lambda batches tokens from each Snowflake batch into sub-batches of this size |
 | `SKYFLOW_CONCURRENCY` | Max parallel Skyflow API calls per Lambda invocation |
-| `CUSTOM_ROWS` | Custom table row count. Equivalent to `--rows N` |
-| `CUSTOM_UNIQUE_TOKENS` | Custom unique token count for Skyflow seeding. Equivalent to `--unique-tokens N` |
 
 ## Quick Start
 
@@ -66,11 +64,11 @@ SKYFLOW_CONCURRENCY=50
 # 1. First run — deploys all infra, creates table, runs benchmark
 ./run_benchmark.sh --rows 5000000 --unique-tokens 500000 --warehouse XL --iterations 2
 
-# 2. Re-run at a different scale (reuse infra + tables)
-./run_benchmark.sh --rows 10000000 --unique-tokens 1000000 --warehouse XL --iterations 3 --skip-deploy --skip-setup
+# 2. Re-run at a different scale (redeploy Lambda, recreate table)
+./run_benchmark.sh --rows 10000000 --unique-tokens 1000000 --warehouse XL --iterations 3 --skip-deploy
 
 # 3. Mock mode — pipeline only, no Skyflow
-./run_benchmark.sh --rows 10000000 --mock --warehouse XL --skip-deploy --skip-setup
+./run_benchmark.sh --rows 10000000 --mock --warehouse XL --skip-deploy
 
 # 4. Cleanup
 ./run_benchmark.sh --cleanup
@@ -84,7 +82,7 @@ When `SKYFLOW_URL` is not set or `--mock` is passed, the Lambda returns `DETOK_<
 
 ```mermaid
 flowchart LR
-    SF[Snowflake Query] -->|4,096 rows/batch| EF[External Function]
+    SF[Snowflake Query] -->|dynamic batch size| EF[External Function]
     EF -->|POST /process| AG[API Gateway<br/>Regional REST<br/>AWS_IAM auth]
     AG --> LM[Lambda<br/>Go · provided.al2023]
     LM -->|DETOK_ prefix + optional delay| AG
@@ -99,7 +97,7 @@ When `SKYFLOW_URL` is set (and `--mock` is not passed), the Lambda calls Skyflow
 
 ```mermaid
 flowchart LR
-    SF[Snowflake Query] -->|4,096 rows/batch| EF[External Function]
+    SF[Snowflake Query] -->|dynamic batch size| EF[External Function]
     EF -->|POST /process<br/>X-Operation header| AG[API Gateway<br/>Regional REST<br/>AWS_IAM auth]
     AG --> LM[Lambda<br/>Go · provided.al2023]
     LM -->|deduplicate tokens<br/>within batch| LM
@@ -124,19 +122,19 @@ sequenceDiagram
     SF->>SF: SELECT detokenize(token) FROM test_table
 
     par Snowflake fans out batches (up to N concurrent Lambdas)
-        SF->>AG: POST /process (batch 1: 4,096 rows)
-        SF->>AG: POST /process (batch 2: 4,096 rows)
-        SF->>AG: POST /process (batch N: 4,096 rows)
+        SF->>AG: POST /process (batch 1)
+        SF->>AG: POST /process (batch 2)
+        SF->>AG: POST /process (batch N)
     end
 
     Note over AG,LM: Each batch handled by one Lambda invocation
 
-    AG->>LM: Invoke (4,096 rows)
+    AG->>LM: Invoke (batch of rows)
 
     alt Mock mode
-        LM->>LM: Generate DETOK_<token> responses
-        LM-->>CW: Log METRIC (batch_size, instance_id)
-        LM->>AG: Return 4,096 results
+        LM->>LM: Count unique tokens + generate DETOK_ responses
+        LM-->>CW: Log METRIC (batch_size, unique_tokens, dedup_pct, ...)
+        LM->>AG: Return results
     else Skyflow mode
         LM->>LM: Deduplicate tokens in batch
         par Sub-batches (SKYFLOW_CONCURRENCY parallel)
@@ -144,9 +142,9 @@ sequenceDiagram
             LM->>SKY: Detokenize (SKYFLOW_BATCH_SIZE tokens)
         end
         SKY->>LM: Plaintext values
-        LM->>LM: Map results back to full 4,096-row batch
-        LM-->>CW: Log METRIC (batch_size, instance_id)
-        LM->>AG: Return 4,096 results
+        LM->>LM: Map results back to full batch
+        LM-->>CW: Log METRIC (batch_size, unique_tokens, dedup_pct, ...)
+        LM->>AG: Return results
     end
 
     AG->>SF: Response
@@ -155,7 +153,7 @@ sequenceDiagram
 
 ## Token Distribution
 
-In Skyflow mode, the benchmark seeds N unique tokens (`--unique-tokens`) across M rows (`--rows`). Each row is assigned a token using a **Zipf (s=1) distribution** — not uniform — to simulate real-world data where a small fraction of tokens (popular customers, frequent products) appear in the majority of rows.
+In Skyflow mode, the benchmark seeds N unique tokens (`--unique-tokens`) across M rows (`--rows`). Each row is assigned a token using a **Zipf (s=1) distribution** — not uniform — to simulate real-world data where a small fraction of tokens (popular customers, frequent products) appear in the majority of rows. Both mock and Skyflow modes track dedup stats per batch.
 
 ### How it works
 
@@ -168,7 +166,7 @@ seed_id = FLOOR(POW(SEED_COUNT, HASH(row_id) / MAX_HASH)) - 1
 
 ### Why this matters
 
-Snowflake sends batches of ~1,000 rows to each Lambda invocation. The Lambda deduplicates tokens within each batch before calling Skyflow — so batch dedup directly determines how many Skyflow API calls are needed.
+Snowflake sends batches of rows to each Lambda invocation (batch size varies dynamically — see [What This Measures](#what-this-measures)). The Lambda deduplicates tokens within each batch before calling Skyflow — so batch dedup directly determines how many Skyflow API calls are needed.
 
 With uniform distribution (`MOD`), every token appears at most once per batch — zero dedup. With Zipf, popular tokens repeat within batches, giving realistic dedup that scales with the token count:
 
@@ -214,27 +212,14 @@ Batch Token Dedup Analysis (from 245 METRIC log lines):
 
 ## Usage
 
-Use `--rows` and `--unique-tokens` to run at any scale. Deploy once, then iterate with `--skip-deploy` (reuse AWS infra) and `--skip-setup` (reuse Snowflake tables).
+Use `--rows` and `--unique-tokens` to run at any scale. Deploy once, then iterate with `--skip-deploy` (reuse AWS infra). Use `--skip-setup` to reuse existing Snowflake tables (note: `--rows` has no effect with `--skip-setup` since the table isn't recreated).
 
 ```bash
-# First run — deploys Lambda, API Gateway, Snowflake objects
-./run_benchmark.sh --rows 5000000 --unique-tokens 500000
-
-# Iterate at different scales
-./run_benchmark.sh --rows 1000000 --unique-tokens 100000 --skip-deploy --skip-setup
-./run_benchmark.sh --rows 50000000 --unique-tokens 5000000 --skip-deploy
-
-# Mock mode — measure pipeline without Skyflow
-./run_benchmark.sh --rows 10000000 --mock --skip-deploy --skip-setup
-
 # Mock with simulated latency
-./run_benchmark.sh --rows 10000000 --mock --delay-ms 50 --skip-deploy --skip-setup
+./run_benchmark.sh --rows 10000000 --mock --delay-ms 50 --skip-deploy
 
 # Probe pipeline fundamentals (batch size, concurrency)
 ./run_benchmark.sh --probe --skip-deploy --skip-setup
-
-# Cleanup everything
-./run_benchmark.sh --cleanup
 ```
 
 ### Scale reference
@@ -247,7 +232,7 @@ Use `--rows` and `--unique-tokens` to run at any scale. Deploy once, then iterat
 | 100M | 10M | ~19% | ~100,000 |
 | 1B | 100M | ~18% | ~1,000,000 |
 
-Lambda invocations ≈ `total_rows / batch_size` (batch size ~1,000 rows). Batch dedup % is per-batch and follows the Zipf distribution — see [Token Distribution](#token-distribution) for details. Actual Skyflow API calls per invocation depend on `SKYFLOW_BATCH_SIZE`, `SKYFLOW_CONCURRENCY`, and the dedup ratio.
+Lambda invocations ≈ `total_rows / batch_size`. Snowflake dynamically sizes batches (~190 rows at 0ms latency, up to ~4,096 at high latency) — invocation counts above assume ~1,000 rows/batch at low latency. Batch dedup % follows the Zipf distribution — see [Token Distribution](#token-distribution). Actual Skyflow API calls per invocation depend on `SKYFLOW_BATCH_SIZE`, `SKYFLOW_CONCURRENCY`, and the dedup ratio.
 
 ## Phases
 
