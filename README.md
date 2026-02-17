@@ -153,6 +153,44 @@ sequenceDiagram
     SF->>SF: Aggregate all batch results
 ```
 
+## Token Distribution
+
+In Skyflow mode, the benchmark seeds N unique tokens (`--unique-tokens`) across M rows (`--rows`). Each row is assigned a token using a **Zipf (s=1) distribution** — not uniform — to simulate real-world data where a small fraction of tokens (popular customers, frequent products) appear in the majority of rows.
+
+### How it works
+
+```sql
+-- Each row maps to a seed token via:
+seed_id = FLOOR(POW(SEED_COUNT, HASH(row_id) / MAX_HASH)) - 1
+```
+
+`POW(N, uniform)` produces a true Zipf distribution where `P(token k) ∝ 1/k`. The most popular token gets ~3-4% of all rows; the least popular gets a handful.
+
+### Why this matters
+
+Snowflake sends batches of ~1,000 rows to each Lambda invocation. The Lambda deduplicates tokens within each batch before calling Skyflow — so batch dedup directly determines how many Skyflow API calls are needed.
+
+With uniform distribution (`MOD`), every token appears at most once per batch — zero dedup. With Zipf, popular tokens repeat within batches, giving realistic dedup that scales with the token count:
+
+| Unique Tokens | Avg Unique / Batch (1K rows) | Avg Dedup % |
+|---|---|---|
+| 1K | ~315 | ~68% |
+| 10K | ~535 | ~47% |
+| 100K | ~700 | ~30% |
+| 500M | ~825 | ~18% |
+
+### End-of-run analysis
+
+Phase 5 fetches Lambda METRIC logs from CloudWatch and displays the actual dedup stats observed during the benchmark:
+
+```
+Batch Token Dedup Analysis (from 245 METRIC log lines):
+  Avg batch size:         1000.0
+  Avg unique tokens:      535.2
+  Avg repeated tokens:    464.8
+  Avg dedup %:            46.5%
+```
+
 ## CLI Flags
 
 | Flag | Default | Description |
@@ -201,17 +239,15 @@ Use `--rows` and `--unique-tokens` to run at any scale. Deploy once, then iterat
 
 ### Scale reference
 
-| Total Rows | Unique Tokens | Dedup % | Lambda Invocations |
-| ---------- | ------------- | ------- | ------------------ |
-| 100K | 10K | 90% | ~25 |
-| 1M | 100K | 90% | ~244 |
-| 5M | 500K | 90% | ~1,221 |
-| 10M | 2.5M | 75% | ~2,442 |
-| 50M | 5M | 90% | ~12,208 |
-| 100M | 25M | 75% | ~24,415 |
-| 1B | 100M | 90% | ~244,141 |
+| Total Rows | Unique Tokens | Batch Dedup % | Lambda Invocations |
+| ---------- | ------------- | ------------- | ------------------ |
+| 100K | 10K | ~47% | ~100 |
+| 1M | 100K | ~30% | ~1,000 |
+| 10M | 1M | ~22% | ~10,000 |
+| 100M | 10M | ~19% | ~100,000 |
+| 1B | 100M | ~18% | ~1,000,000 |
 
-Lambda invocations = `ceil(total_rows / 4,096)`. Actual Skyflow API calls per invocation depend on `SKYFLOW_BATCH_SIZE`, `SKYFLOW_CONCURRENCY`, and the dedup ratio within each 4,096-row batch.
+Lambda invocations ≈ `total_rows / batch_size` (batch size ~1,000 rows). Batch dedup % is per-batch and follows the Zipf distribution — see [Token Distribution](#token-distribution) for details. Actual Skyflow API calls per invocation depend on `SKYFLOW_BATCH_SIZE`, `SKYFLOW_CONCURRENCY`, and the dedup ratio.
 
 ## Phases
 

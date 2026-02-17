@@ -1006,17 +1006,23 @@ TRUST
       FROM ${FUNC_PREFIX}.seed_plaintext"
     ok "Tokenized ${SEED_COUNT} values"
 
-    # Update test tables to use real Skyflow tokens (cycling through seed tokens)
+    # Update test tables to use real Skyflow tokens (Zipf s=1 distribution)
+    # Real-world token frequency follows a power law: a small fraction of tokens
+    # (popular customers, frequent products) appear in the majority of rows.
+    # POW(SEED_COUNT, uniform) produces true Zipf (P(k) ∝ 1/k), giving ~15%
+    # intra-batch dedup even at 500M unique tokens with 1K-row batches.
     for tbl in "${TABLES_TO_GEN[@]}"; do
       row_var="TABLE_ROWS_${tbl}"
       rows=${!row_var}
-      log "  Updating ${tbl} with real tokens..."
+      log "  Updating ${tbl} with real tokens (Zipf distribution)..."
       snow_sql_silent "USE WAREHOUSE ${DATA_GEN_WH};
         UPDATE ${FUNC_PREFIX}.${tbl} t
         SET t.token_value = s.token_value
         FROM ${FUNC_PREFIX}.seed_tokens s
-        WHERE MOD(t.id, ${SEED_COUNT}) = s.id"
-      ok "Updated ${tbl} with real Skyflow tokens"
+        WHERE s.id = LEAST(
+          FLOOR(POW(${SEED_COUNT}, ABS(MOD(HASH(t.id), 100000000)) / 100000000.0)) - 1,
+          ${SEED_COUNT} - 1)"
+      ok "Updated ${tbl} with real Skyflow tokens (Zipf distribution)"
     done
   fi
 
