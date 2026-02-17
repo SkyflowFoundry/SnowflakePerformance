@@ -58,6 +58,8 @@ CONCURRENCY="${CONCURRENCY:-2900}"
 VALIDATE_10B=false
 FORCE_MOCK=false
 PROBE=false
+CUSTOM_ROWS="${CUSTOM_ROWS:-}"
+CUSTOM_UNIQUE_TOKENS="${CUSTOM_UNIQUE_TOKENS:-}"
 
 # Resource naming
 # AWS resources use hyphens, Snowflake uses underscores (SF rejects hyphens in identifiers)
@@ -125,6 +127,8 @@ while [[ $# -gt 0 ]]; do
     --validate-10b) VALIDATE_10B=true; shift ;;
     --mock)                FORCE_MOCK=true; shift ;;
     --probe)               PROBE=true; shift ;;
+    --rows)            CUSTOM_ROWS="$2"; shift 2 ;;
+    --unique-tokens)   CUSTOM_UNIQUE_TOKENS="$2"; shift 2 ;;
     -h|--help)
       echo "Usage: $0 [options]"
       echo "  All credentials and IDs are read from benchmark.conf"
@@ -141,6 +145,8 @@ while [[ $# -gt 0 ]]; do
       echo "  --concurrency N        Lambda reserved concurrency (default: 2900)"
       echo "  --validate-10b         Append XL/2XL x 10B x 1 iteration after main matrix"
       echo "  --mock                 Force mock mode (ignore Skyflow config)"
+      echo "  --rows N               Custom table with N rows (overrides tier table selection)"
+      echo "  --unique-tokens N      Custom unique token count for Skyflow seeding (overrides tier default)"
       echo "  --probe                Probe mode: measure pipeline fundamentals (batch size,"
       echo "                         concurrency, throughput) with mock-only, time-bounded tests"
       exit 0
@@ -168,6 +174,15 @@ elif $MEDIUM; then
 elif $QUICK; then
   ALL_WAREHOUSES=(BENCH_XL)
   ALL_TABLES=(test_tokens_10m test_tokens_100m)
+fi
+
+# Custom rows override (--rows N)
+if [[ -n "$CUSTOM_ROWS" ]]; then
+  if ! [[ "$CUSTOM_ROWS" =~ ^[0-9]+$ ]] || [[ "$CUSTOM_ROWS" -lt 1 ]]; then
+    echo "ERROR: --rows must be a positive integer"; exit 1
+  fi
+  ALL_TABLES=(test_tokens_custom)
+  TABLE_ROWS_test_tokens_custom="$CUSTOM_ROWS"
 fi
 
 # Skyflow mode determination
@@ -743,6 +758,9 @@ echo ""
 ###############################################################################
 if $SKIP_SETUP; then
   log "PHASE 3: Skipping Snowflake setup (--skip-setup)"
+  if [[ -n "$CUSTOM_ROWS" ]]; then
+    warn "--rows specified with --skip-setup: table test_tokens_custom must already exist"
+  fi
 else
   log "PHASE 3: Configuring Snowflake"
 
@@ -939,6 +957,13 @@ TRUST
       SEED_COUNT=2500000     # 25% of 10M
     else
       SEED_COUNT=25000       # default for quick/full
+    fi
+
+    if [[ -n "$CUSTOM_UNIQUE_TOKENS" ]]; then
+      if ! [[ "$CUSTOM_UNIQUE_TOKENS" =~ ^[0-9]+$ ]] || [[ "$CUSTOM_UNIQUE_TOKENS" -lt 1 ]]; then
+        echo "ERROR: --unique-tokens must be a positive integer"; exit 1
+      fi
+      SEED_COUNT="$CUSTOM_UNIQUE_TOKENS"
     fi
 
     log "Seeding real Skyflow tokens (${SEED_COUNT} unique values)..."
