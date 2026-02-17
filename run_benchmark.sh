@@ -1104,6 +1104,10 @@ log "PHASE 4: Running benchmarks (mode=${MODE_LABEL}, delay=${DELAY_MS}ms, itera
 
 FUNC_PREFIX="${SF_DB}.${SF_SCHEMA}"
 
+# ── Track benchmark time window for CloudWatch log fetching ──
+BENCH_EARLIEST_START=""
+BENCH_LATEST_END=""
+
 # ── Probe mode: track query timestamps for CloudWatch correlation ──
 if $PROBE; then
   declare -a PROBE_QUERIES=()  # "wh|tbl|rows|start_ts|end_ts|status|query_id|sf_elapsed"
@@ -1326,6 +1330,14 @@ LIMIT 1;
   WALLCLOCK_MS=$(millis_since "$START_NS")
 
   QUERY_END_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || gdate -u +%Y-%m-%dT%H:%M:%SZ)
+
+  # Update benchmark time window for Phase 5 CloudWatch log fetching
+  if [[ -z "$BENCH_EARLIEST_START" ]] || [[ "$QUERY_START_TS" < "$BENCH_EARLIEST_START" ]]; then
+    BENCH_EARLIEST_START="$QUERY_START_TS"
+  fi
+  if [[ -z "$BENCH_LATEST_END" ]] || [[ "$QUERY_END_TS" > "$BENCH_LATEST_END" ]]; then
+    BENCH_LATEST_END="$QUERY_END_TS"
+  fi
 
   # Detect timeout: snowsql error + wall time near 180s
   local STATUS="complete"
@@ -1717,6 +1729,95 @@ print((dt + datetime.timedelta(minutes=2)).strftime('%Y-%m-%dT%H:%M:%SZ'))
   echo ""
 
   rm -f "$PROBE_LOG_FILE"
+fi
+
+# ── Batch Token Dedup Analysis (all modes) ──
+if [[ -n "$BENCH_EARLIEST_START" && -n "$BENCH_LATEST_END" ]]; then
+  LOG_GROUP_DEDUP="/aws/lambda/${LAMBDA_NAME}"
+
+  log "Waiting 15s for CloudWatch log propagation..."
+  sleep 15
+
+  # Convert time window to epoch ms (add 2 min buffer each side)
+  if [[ "$(uname)" == "Darwin" ]]; then
+    DEDUP_CW_START_MS=$(python3 -c "
+import datetime
+dt = datetime.datetime.strptime('${BENCH_EARLIEST_START}', '%Y-%m-%dT%H:%M:%SZ')
+dt = dt.replace(tzinfo=datetime.timezone.utc)
+print(int((dt.timestamp() - 120) * 1000))
+")
+    DEDUP_CW_END_MS=$(python3 -c "
+import datetime
+dt = datetime.datetime.strptime('${BENCH_LATEST_END}', '%Y-%m-%dT%H:%M:%SZ')
+dt = dt.replace(tzinfo=datetime.timezone.utc)
+print(int((dt.timestamp() + 120) * 1000))
+")
+  else
+    DEDUP_CW_START_MS=$(( $(date -d "$BENCH_EARLIEST_START" +%s) * 1000 - 120000 ))
+    DEDUP_CW_END_MS=$(( $(date -d "$BENCH_LATEST_END" +%s) * 1000 + 120000 ))
+  fi
+
+  DEDUP_LOG_FILE=$(mktemp)
+  aws_ logs filter-log-events \
+    --log-group-name "$LOG_GROUP_DEDUP" \
+    --start-time "$DEDUP_CW_START_MS" \
+    --end-time "$DEDUP_CW_END_MS" \
+    --filter-pattern "METRIC" \
+    --query 'events[].message' \
+    --output text > "$DEDUP_LOG_FILE" 2>/dev/null || warn "Could not fetch CloudWatch logs for dedup analysis"
+
+  DEDUP_LINE_COUNT=$(wc -l < "$DEDUP_LOG_FILE" | tr -d ' ')
+
+  if [[ "$DEDUP_LINE_COUNT" -gt 0 ]]; then
+    # Parse unique_tokens and batch_size from each METRIC line (portable awk — no gawk extensions)
+    DEDUP_STATS=$(awk '
+      /unique_tokens=[0-9]/ {
+        bs = 0; ut = 0
+        n_fields = split($0, fields, " ")
+        for (i = 1; i <= n_fields; i++) {
+          if (fields[i] ~ /^batch_size=/) { split(fields[i], kv, "="); bs = kv[2]+0 }
+          if (fields[i] ~ /^unique_tokens=/) { split(fields[i], kv, "="); ut = kv[2]+0 }
+        }
+        if (bs > 0) {
+          n++
+          sum_bs += bs
+          sum_ut += ut
+          sum_rep += (bs - ut)
+          sum_dedup += (1 - ut/bs) * 100
+        }
+      }
+      END {
+        if (n > 0) {
+          printf "%d %.1f %.1f %.1f %.1f\n", n, sum_bs/n, sum_ut/n, sum_rep/n, sum_dedup/n
+        } else {
+          printf "0 0 0 0 0\n"
+        }
+      }
+    ' "$DEDUP_LOG_FILE")
+
+    DEDUP_N=$(echo "$DEDUP_STATS" | awk '{print $1}')
+    DEDUP_AVG_BS=$(echo "$DEDUP_STATS" | awk '{print $2}')
+    DEDUP_AVG_UT=$(echo "$DEDUP_STATS" | awk '{print $3}')
+    DEDUP_AVG_REP=$(echo "$DEDUP_STATS" | awk '{print $4}')
+    DEDUP_AVG_PCT=$(echo "$DEDUP_STATS" | awk '{print $5}')
+
+    if [[ "$DEDUP_N" -gt 0 ]]; then
+      log "Batch Token Dedup Analysis (from ${DEDUP_N} METRIC log lines):"
+      printf "  Avg batch size:         %s\n" "$DEDUP_AVG_BS"
+      printf "  Avg unique tokens:      %s\n" "$DEDUP_AVG_UT"
+      printf "  Avg repeated tokens:    %s\n" "$DEDUP_AVG_REP"
+      printf "  Avg dedup %%:            %s%%\n" "$DEDUP_AVG_PCT"
+      echo ""
+    else
+      warn "No METRIC lines with unique_tokens found in CloudWatch logs"
+      echo ""
+    fi
+  else
+    warn "No METRIC log lines found in CloudWatch (window: ${BENCH_EARLIEST_START} to ${BENCH_LATEST_END})"
+    echo ""
+  fi
+
+  rm -f "$DEDUP_LOG_FILE"
 fi
 
 # ── CloudWatch metrics (best-effort, 60-minute window) ──

@@ -118,6 +118,7 @@ func handler(ctx context.Context, req events.APIGatewayProxyRequest) (events.API
 		if simulatedDelay > 0 {
 			time.Sleep(simulatedDelay)
 		}
+		seen := make(map[string]struct{}, batchSize)
 		resp = sfResponse{Data: make([][]interface{}, batchSize)}
 		for i, row := range sfReq.Data {
 			if len(row) < 2 {
@@ -126,27 +127,32 @@ func handler(ctx context.Context, req events.APIGatewayProxyRequest) (events.API
 			}
 			rowNum := row[0]
 			tokenVal := fmt.Sprintf("%v", row[1])
+			seen[tokenVal] = struct{}{}
 			resp.Data[i] = []interface{}{rowNum, "DETOK_" + tokenVal}
+		}
+		uniqueTokens := len(seen)
+		dedupPct := 0.0
+		if batchSize > 0 {
+			dedupPct = (1 - float64(uniqueTokens)/float64(batchSize)) * 100
+		}
+		skyflowM = &SkyflowMetrics{
+			UniqueTokens: uniqueTokens,
+			DedupPct:     dedupPct,
 		}
 	}
 
 	processingDur := time.Now().UnixNano() - receiveTs
 
-	// Log to CloudWatch
-	if skyflowM != nil {
-		lambdaOverheadMs := processingDur/1e6 - skyflowM.SkyflowWallMs
-		log.Printf("METRIC query_id=%s batch_id=%s batch_size=%d operation=%s mode=%s duration_ms=%d "+
-			"unique_tokens=%d dedup_pct=%.1f skyflow_calls=%d skyflow_wall_ms=%d "+
-			"call_min_ms=%d call_avg_ms=%d call_max_ms=%d lambda_overhead_ms=%d errors=%d "+
-			"invocation=%d instance=%s config=%s",
-			queryID, batchID, batchSize, operation, mode, processingDur/1e6,
-			skyflowM.UniqueTokens, skyflowM.DedupPct, skyflowM.SkyflowCalls, skyflowM.SkyflowWallMs,
-			skyflowM.CallMinMs, skyflowM.CallAvgMs, skyflowM.CallMaxMs, lambdaOverheadMs, skyflowM.Errors,
-			invNum, lambdaInstanceID, benchConfig)
-	} else {
-		log.Printf("METRIC query_id=%s batch_id=%s batch_size=%d operation=%s mode=%s duration_ms=%d invocation=%d instance=%s config=%s",
-			queryID, batchID, batchSize, operation, mode, processingDur/1e6, invNum, lambdaInstanceID, benchConfig)
-	}
+	// Log to CloudWatch (skyflowM is always set — both Skyflow and mock modes populate it)
+	lambdaOverheadMs := processingDur/1e6 - skyflowM.SkyflowWallMs
+	log.Printf("METRIC query_id=%s batch_id=%s batch_size=%d operation=%s mode=%s duration_ms=%d "+
+		"unique_tokens=%d dedup_pct=%.1f skyflow_calls=%d skyflow_wall_ms=%d "+
+		"call_min_ms=%d call_avg_ms=%d call_max_ms=%d lambda_overhead_ms=%d errors=%d "+
+		"invocation=%d instance=%s config=%s",
+		queryID, batchID, batchSize, operation, mode, processingDur/1e6,
+		skyflowM.UniqueTokens, skyflowM.DedupPct, skyflowM.SkyflowCalls, skyflowM.SkyflowWallMs,
+		skyflowM.CallMinMs, skyflowM.CallAvgMs, skyflowM.CallMaxMs, lambdaOverheadMs, skyflowM.Errors,
+		invNum, lambdaInstanceID, benchConfig)
 
 	respBody, err := json.Marshal(resp)
 	if err != nil {
