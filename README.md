@@ -60,6 +60,22 @@ SKYFLOW_CONCURRENCY=50
 | `CUSTOM_ROWS` | Custom table row count. Equivalent to `--rows N` |
 | `CUSTOM_UNIQUE_TOKENS` | Custom unique token count for Skyflow seeding. Equivalent to `--unique-tokens N` |
 
+## Quick Start
+
+```bash
+# 1. First run — deploys all infra, creates table, runs benchmark
+./run_benchmark.sh --rows 5000000 --unique-tokens 500000 --warehouse XL --iterations 2
+
+# 2. Re-run at a different scale (reuse infra + tables)
+./run_benchmark.sh --rows 10000000 --unique-tokens 1000000 --warehouse XL --iterations 3 --skip-deploy --skip-setup
+
+# 3. Mock mode — pipeline only, no Skyflow
+./run_benchmark.sh --rows 10000000 --mock --warehouse XL --skip-deploy --skip-setup
+
+# 4. Cleanup
+./run_benchmark.sh --cleanup
+```
+
 ## Architecture
 
 ### Mock mode
