@@ -1785,14 +1785,15 @@ print(int((dt.timestamp() + 120) * 1000))
   DEDUP_LINE_COUNT=$(wc -l < "$DEDUP_LOG_FILE" | tr -d ' ')
 
   if [[ "$DEDUP_LINE_COUNT" -gt 0 ]]; then
-    # Parse unique_tokens and batch_size from each METRIC line (portable awk — no gawk extensions)
+    # Parse unique_tokens, batch_size, and skyflow_wall_ms from each METRIC line (portable awk — no gawk extensions)
     DEDUP_STATS=$(awk '
       /unique_tokens=[0-9]/ {
-        bs = 0; ut = 0
+        bs = 0; ut = 0; sw = 0
         n_fields = split($0, fields, " ")
         for (i = 1; i <= n_fields; i++) {
           if (fields[i] ~ /^batch_size=/) { split(fields[i], kv, "="); bs = kv[2]+0 }
           if (fields[i] ~ /^unique_tokens=/) { split(fields[i], kv, "="); ut = kv[2]+0 }
+          if (fields[i] ~ /^skyflow_wall_ms=/) { split(fields[i], kv, "="); sw = kv[2]+0 }
         }
         if (bs > 0) {
           n++
@@ -1800,13 +1801,15 @@ print(int((dt.timestamp() + 120) * 1000))
           sum_ut += ut
           sum_rep += (bs - ut)
           sum_dedup += (1 - ut/bs) * 100
+          if (sw > 0) { n_sw++; sum_sf_tps += bs * 1000 / sw }
         }
       }
       END {
         if (n > 0) {
-          printf "%d %.1f %.1f %.1f %.1f\n", n, sum_bs/n, sum_ut/n, sum_rep/n, sum_dedup/n
+          sf_tps = (n_sw > 0) ? sum_sf_tps / n_sw : 0
+          printf "%d %.1f %.1f %.1f %.1f %.0f\n", n, sum_bs/n, sum_ut/n, sum_rep/n, sum_dedup/n, sf_tps
         } else {
-          printf "0 0 0 0 0\n"
+          printf "0 0 0 0 0 0\n"
         }
       }
     ' "$DEDUP_LOG_FILE")
@@ -1816,6 +1819,7 @@ print(int((dt.timestamp() + 120) * 1000))
     DEDUP_AVG_UT=$(echo "$DEDUP_STATS" | awk '{print $3}')
     DEDUP_AVG_REP=$(echo "$DEDUP_STATS" | awk '{print $4}')
     DEDUP_AVG_PCT=$(echo "$DEDUP_STATS" | awk '{print $5}')
+    DEDUP_AVG_SF_TPS=$(echo "$DEDUP_STATS" | awk '{print $6}')
 
     if [[ "$DEDUP_N" -gt 0 ]]; then
       printf "  Batch dedup (%s samples): avg_batch=%s  unique=%s  repeated=%s  dedup=%s%%\n" \
@@ -1883,6 +1887,60 @@ if [[ -n "$CW_TABLE" ]]; then
   done <<< "$CW_TABLE"
 else
   warn "No CloudWatch metric data available"
+fi
+
+# ── Highlights ──
+CW_PEAK_CONC=$(jq '[.Datapoints[].Maximum] | max // 0 | floor' <<< "$CW_CONCURRENT" 2>/dev/null || echo "-")
+[[ "$CW_PEAK_CONC" == "0" || -z "$CW_PEAK_CONC" ]] && CW_PEAK_CONC="-"
+
+# Query median throughput, rows, and sf elapsed from Snowflake
+# Aliases avoid reserved words (ROWS) and digits in column headers so parsing is safe
+HL_SF_QUERY=$(snow_sql "SELECT ROUND(MEDIAN(sf_rows_per_sec), 0) AS rps, MAX(row_count) AS vol, ROUND(MEDIAN(sf_elapsed_ms), 0) AS sfms FROM ${FUNC_PREFIX}.benchmark_results WHERE run_phase = 'measured' AND simulated_delay_ms = ${DELAY_MS}")
+# Extract first data row: starts with | and contains a digit (skips header + separator lines)
+HL_DATA_LINE=$(echo "$HL_SF_QUERY" | awk '/^[|]/ && /[0-9]/' | head -1)
+HIGHLIGHT_RPS=$(echo "$HL_DATA_LINE" | awk -F'|' '{gsub(/[ ]+/,"",$2); print $2}')
+HL_SF_ROWS=$(echo "$HL_DATA_LINE" | awk -F'|' '{gsub(/[ ]+/,"",$3); print $3}')
+HL_SF_MS=$(echo "$HL_DATA_LINE" | awk -F'|' '{gsub(/[ ]+/,"",$4); print $4}')
+[[ -z "$HIGHLIGHT_RPS" || "$HIGHLIGHT_RPS" == "NULL" ]] && HIGHLIGHT_RPS="-"
+[[ -z "$HL_SF_ROWS" || "$HL_SF_ROWS" == "NULL" ]] && HL_SF_ROWS="-"
+[[ -z "$HL_SF_MS" || "$HL_SF_MS" == "NULL" ]] && HL_SF_MS="-"
+
+# Snowflake avg batch size (rounded to int)
+HL_SF_BATCH=$(printf "%.0f" "${DEDUP_AVG_BS:-0}" 2>/dev/null || echo "-")
+[[ "$HL_SF_BATCH" == "0" || -z "$HL_SF_BATCH" ]] && HL_SF_BATCH="-"
+
+# Skyflow: throughput, total tokens, and dedup from METRIC logs
+HL_SF_TPS="${DEDUP_AVG_SF_TPS:-0}"
+[[ "$HL_SF_TPS" == "0" || -z "$HL_SF_TPS" ]] && HL_SF_TPS="-"
+# Total tokens = invocations * avg batch size
+if [[ "${DEDUP_N:-0}" -gt 0 && "${DEDUP_AVG_BS:-0}" != "0" ]]; then
+  HL_TOTAL_TOKENS=$(awk "BEGIN { printf \"%.0f\", ${DEDUP_N} * ${DEDUP_AVG_BS} }")
+else
+  HL_TOTAL_TOKENS="-"
+fi
+HL_DEDUP_PCT="${DEDUP_AVG_PCT:-"-"}"
+[[ "$HL_DEDUP_PCT" == "0" || -z "$HL_DEDUP_PCT" ]] && HL_DEDUP_PCT="-"
+
+# Format cells with suffixes, falling back to "-" for unavailable values
+HL_FMT="  %-18s| %14s | %25s | %8s | %11s | %s\n"
+HL_SEP="  %-18s|%s|%s|%s|%s|%s\n"
+
+HL_SF_THRU="${HIGHLIGHT_RPS} rows/s"; [[ "$HIGHLIGHT_RPS" == "-" ]] && HL_SF_THRU="-"
+HL_SF_VOL="${HL_SF_ROWS} rows";      [[ "$HL_SF_ROWS" == "-" ]]    && HL_SF_VOL="-"
+HL_SF_DUR="${HL_SF_MS}ms";           [[ "$HL_SF_MS" == "-" ]]      && HL_SF_DUR="-"
+HL_SF_BATCH_STR="avg~${HL_SF_BATCH}"; [[ "$HL_SF_BATCH" == "-" ]] && HL_SF_BATCH_STR="-"
+HL_SF_CONC="${CW_PEAK_CONC} (peak)"; [[ "$CW_PEAK_CONC" == "-" ]] && HL_SF_CONC="-"
+
+echo ""
+log "── Highlights ──────────────────────────────────────────────────────────────────────────"
+printf "$HL_FMT" "PIPELINE" "THROUGHPUT" "VOLUME" "DURATION" "BATCH" "CONCURRENCY"
+printf "$HL_SEP" "------------------" "----------------" "---------------------------" "----------" "-------------" "------------"
+printf "$HL_FMT" "Snowflake -> l" "$HL_SF_THRU" "$HL_SF_VOL" "$HL_SF_DUR" "$HL_SF_BATCH_STR" "$HL_SF_CONC"
+if $SKYFLOW_MODE; then
+  HL_SK_THRU="${HL_SF_TPS} tok/s";  [[ "$HL_SF_TPS" == "-" ]]        && HL_SK_THRU="-"
+  HL_SK_VOL="${HL_TOTAL_TOKENS} tok, ${HL_DEDUP_PCT}%dd"
+  [[ "$HL_TOTAL_TOKENS" == "-" ]] && HL_SK_VOL="-"
+  printf "$HL_FMT" "Lambda -> Skyflow" "$HL_SK_THRU" "$HL_SK_VOL" "-" "${SKYFLOW_BATCH_SIZE:-"-"}" "${SKYFLOW_CONCURRENCY:-"-"}"
 fi
 
 echo ""
