@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -45,33 +46,66 @@ type SkyflowClient struct {
 	client *http.Client
 }
 
-// loadSkyflowConfig reads Skyflow configuration from environment variables.
+// loadSkyflowConfigs reads Skyflow configuration from environment variables.
 // Returns nil if SKYFLOW_DATA_PLANE_URL is not set (mock mode).
-func loadSkyflowConfig() *SkyflowConfig {
+// Supports per-entity vault IDs via SKYFLOW_VAULT_ID_{ENTITY} env vars.
+// Falls back to single SKYFLOW_VAULT_ID for backward compatibility.
+func loadSkyflowConfigs() map[string]*SkyflowConfig {
 	url := os.Getenv("SKYFLOW_DATA_PLANE_URL")
 	if url == "" {
 		return nil
 	}
 
-	cfg := &SkyflowConfig{
-		DataPlaneURL:   url,
-		AccountID:      os.Getenv("SKYFLOW_ACCOUNT_ID"),
-		APIKey:         os.Getenv("SKYFLOW_API_KEY"),
-		VaultID:        os.Getenv("SKYFLOW_VAULT_ID"),
-		TableName:      envOrDefault("SKYFLOW_TABLE_NAME", "table1"),
-		ColumnName:     envOrDefault("SKYFLOW_COLUMN_NAME", "name"),
-		BatchSize:      envIntOrDefault("SKYFLOW_BATCH_SIZE", 25),
-		MaxConcurrency: envIntOrDefault("SKYFLOW_MAX_CONCURRENCY", 10),
-	}
+	apiKey := os.Getenv("SKYFLOW_API_KEY")
+	accountID := os.Getenv("SKYFLOW_ACCOUNT_ID")
+	batchSize := envIntOrDefault("SKYFLOW_BATCH_SIZE", 25)
+	maxConcurrency := envIntOrDefault("SKYFLOW_MAX_CONCURRENCY", 10)
 
-	if cfg.APIKey == "" {
+	if apiKey == "" {
 		log.Printf("WARN: SKYFLOW_DATA_PLANE_URL set but SKYFLOW_API_KEY missing — Skyflow calls will fail")
 	}
-	if cfg.VaultID == "" {
-		log.Printf("WARN: SKYFLOW_DATA_PLANE_URL set but SKYFLOW_VAULT_ID missing — Skyflow calls will fail")
+
+	entities := []string{"NAME", "ID", "SSN", "DOB", "EMAIL"}
+	configs := make(map[string]*SkyflowConfig)
+
+	// Try per-entity vault IDs first
+	for _, entity := range entities {
+		vaultID := os.Getenv("SKYFLOW_VAULT_ID_" + entity)
+		if vaultID == "" {
+			continue
+		}
+		configs[entity] = &SkyflowConfig{
+			DataPlaneURL:   url,
+			AccountID:      accountID,
+			APIKey:         apiKey,
+			VaultID:        vaultID,
+			TableName:      "table1",
+			ColumnName:     strings.ToLower(entity),
+			BatchSize:      batchSize,
+			MaxConcurrency: maxConcurrency,
+		}
 	}
 
-	return cfg
+	// Backward compat: fall back to single SKYFLOW_VAULT_ID if no per-entity vars found
+	if len(configs) == 0 {
+		vaultID := os.Getenv("SKYFLOW_VAULT_ID")
+		if vaultID == "" {
+			log.Printf("WARN: SKYFLOW_DATA_PLANE_URL set but no SKYFLOW_VAULT_ID or per-entity vault IDs found")
+			return nil
+		}
+		configs["NAME"] = &SkyflowConfig{
+			DataPlaneURL:   url,
+			AccountID:      accountID,
+			APIKey:         apiKey,
+			VaultID:        vaultID,
+			TableName:      envOrDefault("SKYFLOW_TABLE_NAME", "table1"),
+			ColumnName:     envOrDefault("SKYFLOW_COLUMN_NAME", "name"),
+			BatchSize:      batchSize,
+			MaxConcurrency: maxConcurrency,
+		}
+	}
+
+	return configs
 }
 
 func envOrDefault(key, fallback string) string {

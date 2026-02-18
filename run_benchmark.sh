@@ -37,12 +37,17 @@ _require_conf AWS_PROFILE
 _require_conf SF_CONNECTION
 _require_conf SKYFLOW_URL
 _require_conf SKYFLOW_API_KEY
-_require_conf SKYFLOW_VAULT_ID
 _require_conf SKYFLOW_ACCOUNT_ID
-_require_conf SKYFLOW_TABLE
-_require_conf SKYFLOW_COLUMN
+_require_conf SKYFLOW_ENTITIES
 _require_conf SKYFLOW_BATCH_SIZE
 _require_conf SKYFLOW_CONCURRENCY
+
+# Validate per-entity vault IDs
+read -ra ENTITIES <<< "$SKYFLOW_ENTITIES"
+for entity in "${ENTITIES[@]}"; do
+  upper=$(echo "$entity" | tr '[:lower:]' '[:upper:]')
+  _require_conf "SKYFLOW_VAULT_ID_${upper}"
+done
 
 # ─── Runtime flags (not in config file) ──────────────────────────────────────
 SKIP_DEPLOY=false
@@ -61,6 +66,7 @@ PROBE=false
 CUSTOM_ROWS="${CUSTOM_ROWS:-}"
 CUSTOM_UNIQUE_TOKENS="${CUSTOM_UNIQUE_TOKENS:-}"
 CUSTOM_WAREHOUSE="${CUSTOM_WAREHOUSE:-}"
+CUSTOM_ENTITY="${CUSTOM_ENTITY:-}"
 
 # Resource naming
 # AWS resources use hyphens, Snowflake uses underscores (SF rejects hyphens in identifiers)
@@ -131,6 +137,7 @@ while [[ $# -gt 0 ]]; do
     --rows)            CUSTOM_ROWS="$2"; shift 2 ;;
     --unique-tokens)   CUSTOM_UNIQUE_TOKENS="$2"; shift 2 ;;
     --warehouse)       CUSTOM_WAREHOUSE="$2"; shift 2 ;;
+    --entity)          CUSTOM_ENTITY="$2"; shift 2 ;;
     -h|--help)
       echo "Usage: $0 [options]"
       echo "  All credentials and IDs are read from benchmark.conf"
@@ -150,6 +157,7 @@ while [[ $# -gt 0 ]]; do
       echo "  --rows N               Custom table with N rows (overrides tier table selection)"
       echo "  --unique-tokens N      Custom unique token count for Skyflow seeding (overrides tier default)"
       echo "  --warehouse SIZE       Warehouse size: XS, S, M, L, XL, 2XL, 3XL, 4XL (overrides tier)"
+      echo "  --entity ENTITY        Run only this entity: name, id, ssn, dob, email (default: all)"
       echo "  --probe                Probe mode: measure pipeline fundamentals (batch size,"
       echo "                         concurrency, throughput) with mock-only, time-bounded tests"
       exit 0
@@ -201,6 +209,22 @@ if [[ -n "$CUSTOM_ROWS" ]]; then
   fi
   ALL_TABLES=(test_tokens_custom)
   TABLE_ROWS_test_tokens_custom="$CUSTOM_ROWS"
+fi
+
+# Custom entity filter (--entity NAME)
+if [[ -n "$CUSTOM_ENTITY" ]]; then
+  CUSTOM_ENTITY_LOWER=$(echo "$CUSTOM_ENTITY" | tr '[:upper:]' '[:lower:]')
+  # Validate that entity is in SKYFLOW_ENTITIES
+  ENTITY_FOUND=false
+  for e in "${ENTITIES[@]}"; do
+    if [[ "$e" == "$CUSTOM_ENTITY_LOWER" ]]; then
+      ENTITY_FOUND=true; break
+    fi
+  done
+  if ! $ENTITY_FOUND; then
+    echo "ERROR: --entity '${CUSTOM_ENTITY}' not in SKYFLOW_ENTITIES (${SKYFLOW_ENTITIES})"; exit 1
+  fi
+  ENTITIES=("$CUSTOM_ENTITY_LOWER")
 fi
 
 # Skyflow mode determination
@@ -583,12 +607,15 @@ POLICY
   if $SKYFLOW_MODE; then
     LAMBDA_SKYFLOW_ENV=",SKYFLOW_DATA_PLANE_URL=${SKYFLOW_URL}"
     LAMBDA_SKYFLOW_ENV+=",SKYFLOW_API_KEY=${SKYFLOW_API_KEY}"
-    LAMBDA_SKYFLOW_ENV+=",SKYFLOW_VAULT_ID=${SKYFLOW_VAULT_ID}"
     LAMBDA_SKYFLOW_ENV+=",SKYFLOW_ACCOUNT_ID=${SKYFLOW_ACCOUNT_ID}"
-    LAMBDA_SKYFLOW_ENV+=",SKYFLOW_TABLE_NAME=${SKYFLOW_TABLE}"
-    LAMBDA_SKYFLOW_ENV+=",SKYFLOW_COLUMN_NAME=${SKYFLOW_COLUMN}"
     LAMBDA_SKYFLOW_ENV+=",SKYFLOW_BATCH_SIZE=${SKYFLOW_BATCH_SIZE}"
     LAMBDA_SKYFLOW_ENV+=",SKYFLOW_MAX_CONCURRENCY=${SKYFLOW_CONCURRENCY}"
+    # Per-entity vault IDs
+    for entity in "${ENTITIES[@]}"; do
+      upper=$(echo "$entity" | tr '[:lower:]' '[:upper:]')
+      vault_var="SKYFLOW_VAULT_ID_${upper}"
+      LAMBDA_SKYFLOW_ENV+=",SKYFLOW_VAULT_ID_${upper}=${!vault_var}"
+    done
   fi
 
   # Lambda memory/timeout — higher for Skyflow mode (real HTTP calls)
@@ -632,7 +659,12 @@ POLICY
   if $SKYFLOW_MODE; then
     ok "Lambda mode: SKYFLOW (memory=${LAMBDA_MEMORY}MB, timeout=${LAMBDA_TIMEOUT}s)"
     ok "  Skyflow URL: ${SKYFLOW_URL}"
-    ok "  Vault: ${SKYFLOW_VAULT_ID}, Table: ${SKYFLOW_TABLE}, Column: ${SKYFLOW_COLUMN}"
+    ok "  Entities: ${ENTITIES[*]}"
+    for entity in "${ENTITIES[@]}"; do
+      upper=$(echo "$entity" | tr '[:lower:]' '[:upper:]')
+      vault_var="SKYFLOW_VAULT_ID_${upper}"
+      ok "  ${upper}: vault=${!vault_var}"
+    done
     ok "  Batch: ${SKYFLOW_BATCH_SIZE}, Concurrency: ${SKYFLOW_CONCURRENCY}"
   else
     ok "Lambda mode: MOCK"
@@ -895,23 +927,26 @@ TRUST
   ok "Function: benchmark_detokenize_default"
 
   if $SKYFLOW_MODE; then
-    # Skyflow tokenize function
-    snow_sql_silent "CREATE OR REPLACE EXTERNAL FUNCTION ${FUNC_PREFIX}.benchmark_tokenize(value VARCHAR)
-      RETURNS VARIANT
-      API_INTEGRATION = ${INTEGRATION_NAME}
-      HEADERS = ('X-Operation' = 'tokenize', 'X-Data-Type' = 'NAME', 'X-Vault-Type' = 'HIGH_PERF')
-      CONTEXT_HEADERS = (CURRENT_TIMESTAMP)
-      AS '${API_URL}/process'"
-    ok "Function: benchmark_tokenize"
+    # Per-entity tokenize and detokenize functions
+    for entity in "${ENTITIES[@]}"; do
+      upper=$(echo "$entity" | tr '[:lower:]' '[:upper:]')
 
-    # Skyflow detokenize function
-    snow_sql_silent "CREATE OR REPLACE EXTERNAL FUNCTION ${FUNC_PREFIX}.benchmark_detokenize(token_value VARCHAR)
-      RETURNS VARIANT
-      API_INTEGRATION = ${INTEGRATION_NAME}
-      HEADERS = ('X-Operation' = 'detokenize', 'X-Data-Type' = 'NAME', 'X-Vault-Type' = 'HIGH_PERF')
-      CONTEXT_HEADERS = (CURRENT_TIMESTAMP)
-      AS '${API_URL}/process'"
-    ok "Function: benchmark_detokenize"
+      snow_sql_silent "CREATE OR REPLACE EXTERNAL FUNCTION ${FUNC_PREFIX}.TOK_${entity}(value VARCHAR)
+        RETURNS VARIANT
+        API_INTEGRATION = ${INTEGRATION_NAME}
+        HEADERS = ('X-Operation' = 'tokenize', 'X-Data-Type' = '${upper}')
+        CONTEXT_HEADERS = (CURRENT_TIMESTAMP)
+        AS '${API_URL}/process'"
+      ok "Function: TOK_${entity}"
+
+      snow_sql_silent "CREATE OR REPLACE EXTERNAL FUNCTION ${FUNC_PREFIX}.DETOK_${entity}(token_value VARCHAR)
+        RETURNS VARIANT
+        API_INTEGRATION = ${INTEGRATION_NAME}
+        HEADERS = ('X-Operation' = 'detokenize', 'X-Data-Type' = '${upper}')
+        CONTEXT_HEADERS = (CURRENT_TIMESTAMP)
+        AS '${API_URL}/process'"
+      ok "Function: DETOK_${entity}"
+    done
   fi
 
   # ── Warehouses (create before data gen so we can use a large WH for big tables) ──
@@ -969,8 +1004,11 @@ else
       CREATE OR REPLACE TABLE ${FUNC_PREFIX}.${tbl} AS
       SELECT
         ${SEQ_FUNC} AS id,
-        UUID_STRING() AS token_value,
-        'extra_data_' || ${SEQ_FUNC}::VARCHAR AS extra_col
+        UUID_STRING() AS tok_name,
+        UUID_STRING() AS tok_id,
+        UUID_STRING() AS tok_ssn,
+        UUID_STRING() AS tok_dob,
+        UUID_STRING() AS tok_email
       FROM TABLE(GENERATOR(ROWCOUNT => ${rows}))"
     ok "Table: ${tbl} (${rows} rows)"
   done
@@ -993,49 +1031,72 @@ else
       SEED_COUNT="$CUSTOM_UNIQUE_TOKENS"
     fi
 
-    log "Seeding real Skyflow tokens (${SEED_COUNT} unique values)..."
+    log "Seeding real Skyflow tokens (${SEED_COUNT} unique values per entity)..."
 
-    # Generate unique plaintext values
-    snow_sql_silent "USE WAREHOUSE ${DATA_GEN_WH};
-      CREATE OR REPLACE TABLE ${FUNC_PREFIX}.seed_plaintext AS
-      SELECT
-        SEQ4() AS id,
-        'name_' || SEQ4()::VARCHAR AS plaintext_value
-      FROM TABLE(GENERATOR(ROWCOUNT => ${SEED_COUNT}))"
-    ok "Created ${SEED_COUNT} seed plaintext values"
+    # Entity offsets for uncorrelated Zipf distributions
+    ENTITY_OFFSET=0
 
-    # Tokenize via the benchmark_tokenize function to get real Skyflow tokens
-    log "  Tokenizing ${SEED_COUNT} values via Skyflow..."
-    snow_sql_silent "USE WAREHOUSE ${DATA_GEN_WH};
-      CREATE OR REPLACE TABLE ${FUNC_PREFIX}.seed_tokens AS
-      SELECT
-        id,
-        plaintext_value,
-        ${FUNC_PREFIX}.benchmark_tokenize(plaintext_value)::VARCHAR AS token_value
-      FROM ${FUNC_PREFIX}.seed_plaintext"
-    ok "Tokenized ${SEED_COUNT} values"
+    for entity in "${ENTITIES[@]}"; do
+      upper=$(echo "$entity" | tr '[:lower:]' '[:upper:]')
+      ENTITY_OFFSET=$((ENTITY_OFFSET + 1))
 
-    # Update test tables to use real Skyflow tokens (Zipf s=1 distribution)
-    # Real-world token frequency follows a power law: a small fraction of tokens
-    # (popular customers, frequent products) appear in the majority of rows.
-    # POW(SEED_COUNT, uniform) produces true Zipf (P(k) ∝ 1/k), giving ~15%
-    # intra-batch dedup even at 500M unique tokens with 1K-row batches.
-    for tbl in "${TABLES_TO_GEN[@]}"; do
-      row_var="TABLE_ROWS_${tbl}"
-      rows=${!row_var}
-      log "  Updating ${tbl} with real tokens (Zipf distribution)..."
+      # Generate entity-specific plaintext patterns
+      case "$entity" in
+        name)
+          PLAINTEXT_EXPR="'Person_' || SEQ4()::VARCHAR || ' Smith_' || MOD(SEQ4(), 1000)::VARCHAR"
+          ;;
+        id)
+          PLAINTEXT_EXPR="'ID-' || LPAD(SEQ4()::VARCHAR, 8, '0')"
+          ;;
+        ssn)
+          PLAINTEXT_EXPR="LPAD(MOD(SEQ4(), 900)::VARCHAR + 100, 3, '0') || '-' || LPAD(MOD(SEQ4(), 90)::VARCHAR + 10, 2, '0') || '-' || LPAD(MOD(SEQ4(), 9000)::VARCHAR + 1000, 4, '0')"
+          ;;
+        dob)
+          PLAINTEXT_EXPR="(1950 + MOD(SEQ4(), 56))::VARCHAR || '-' || LPAD((MOD(SEQ4(), 12) + 1)::VARCHAR, 2, '0') || '-' || LPAD((MOD(SEQ4(), 28) + 1)::VARCHAR, 2, '0')"
+          ;;
+        email)
+          PLAINTEXT_EXPR="'user_' || SEQ4()::VARCHAR || '@example' || MOD(SEQ4(), 100)::VARCHAR || '.com'"
+          ;;
+      esac
+
+      log "  Generating seed plaintext for ${entity}..."
       snow_sql_silent "USE WAREHOUSE ${DATA_GEN_WH};
-        UPDATE ${FUNC_PREFIX}.${tbl} t
-        SET t.token_value = s.token_value
-        FROM ${FUNC_PREFIX}.seed_tokens s
-        WHERE s.id = LEAST(
-          FLOOR(POW(${SEED_COUNT}, ABS(MOD(HASH(t.id), 100000000)) / 100000000.0)) - 1,
-          ${SEED_COUNT} - 1)"
-      ok "Updated ${tbl} with real Skyflow tokens (Zipf distribution)"
+        CREATE OR REPLACE TABLE ${FUNC_PREFIX}.seed_plaintext_${entity} AS
+        SELECT
+          SEQ4() AS id,
+          ${PLAINTEXT_EXPR} AS plaintext_value
+        FROM TABLE(GENERATOR(ROWCOUNT => ${SEED_COUNT}))"
+      ok "Created ${SEED_COUNT} seed plaintext values for ${entity}"
+
+      log "  Tokenizing ${SEED_COUNT} ${entity} values via Skyflow..."
+      snow_sql_silent "USE WAREHOUSE ${DATA_GEN_WH};
+        CREATE OR REPLACE TABLE ${FUNC_PREFIX}.seed_tokens_${entity} AS
+        SELECT
+          id,
+          plaintext_value,
+          ${FUNC_PREFIX}.TOK_${entity}(plaintext_value)::VARCHAR AS token_value
+        FROM ${FUNC_PREFIX}.seed_plaintext_${entity}"
+      ok "Tokenized ${SEED_COUNT} ${entity} values"
+
+      # Update test tables to use real Skyflow tokens (Zipf s=1 distribution)
+      # Use HASH(t.id + entity_offset) for uncorrelated distributions per entity
+      for tbl in "${TABLES_TO_GEN[@]}"; do
+        row_var="TABLE_ROWS_${tbl}"
+        rows=${!row_var}
+        log "  Updating ${tbl}.tok_${entity} with real tokens (Zipf distribution)..."
+        snow_sql_silent "USE WAREHOUSE ${DATA_GEN_WH};
+          UPDATE ${FUNC_PREFIX}.${tbl} t
+          SET t.tok_${entity} = s.token_value
+          FROM ${FUNC_PREFIX}.seed_tokens_${entity} s
+          WHERE s.id = LEAST(
+            FLOOR(POW(${SEED_COUNT}, ABS(MOD(HASH(t.id + ${ENTITY_OFFSET} * 1000000007), 100000000)) / 100000000.0)) - 1,
+            ${SEED_COUNT} - 1)"
+        ok "Updated ${tbl}.tok_${entity} with real Skyflow tokens"
+      done
     done
   fi
 
-  # ── Results table (with iteration and run_phase columns) ──
+  # ── Results table (with iteration, run_phase, and entity_type columns) ──
   snow_sql_silent "CREATE OR REPLACE TABLE ${FUNC_PREFIX}.benchmark_results (
     test_id VARCHAR DEFAULT UUID_STRING(),
     ts TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
@@ -1049,47 +1110,53 @@ else
     sf_rows_per_sec FLOAT,
     simulated_delay_ms INTEGER,
     iteration INTEGER,
-    run_phase VARCHAR
+    run_phase VARCHAR,
+    entity_type VARCHAR
   )"
   ok "Results table created"
 
   # ── Smoke test ──
   log "Running smoke test..."
   if $SKYFLOW_MODE; then
-    # Skyflow mode: tokenize a value, then detokenize the result — verify round-trip
-    log "  Skyflow smoke test: tokenize → detokenize round-trip..."
-    SMOKE_TOKEN=$(snow_sql "SELECT ${FUNC_PREFIX}.benchmark_tokenize('smoke_test_value')::VARCHAR AS result" 2>&1 || true)
-    if echo "$SMOKE_TOKEN" | grep -qi "error\|fail"; then
-      err "Skyflow tokenize smoke test failed"
-      echo "Tokenize output:"
-      echo "$SMOKE_TOKEN"
-      die "Smoke test failed. Check Skyflow credentials and Lambda logs."
-    fi
-    ok "Smoke test: tokenize succeeded"
+    # Skyflow mode: per-entity tokenize → detokenize round-trip
+    # Representative test values per entity type
+    smoke_value_for_entity() {
+      case "$1" in
+        name)  echo "John Smith" ;;
+        id)    echo "ID-00012345" ;;
+        ssn)   echo "123-45-6789" ;;
+        dob)   echo "1990-01-15" ;;
+        email) echo "smoke@example.com" ;;
+      esac
+    }
 
-    # Extract the token value from snowsql table output
-    # Filter: remove border lines (+---+), header (RESULT), empty lines, then strip pipes/spaces
-    TOKEN_VAL=$(echo "$SMOKE_TOKEN" | grep -v '^+\|^$\|RESULT\|result\|row' | grep -v '^\s*|[-]\+|' | tr -d '[:space:]|' | head -1)
-    if [[ -n "$TOKEN_VAL" ]]; then
-      SMOKE_DETOK=$(snow_sql "SELECT ${FUNC_PREFIX}.benchmark_detokenize('${TOKEN_VAL}')::VARCHAR AS result" 2>&1 || true)
-      if echo "$SMOKE_DETOK" | grep -qi "smoke_test_value"; then
-        ok "Smoke test: round-trip verified (tokenize → detokenize = original value)"
+    for entity in "${ENTITIES[@]}"; do
+      SMOKE_VAL=$(smoke_value_for_entity "$entity")
+      log "  Skyflow smoke test: ${entity} (${SMOKE_VAL})..."
+
+      # Use JSON output for reliable token extraction
+      SMOKE_JSON=$(snow_sql_json "SELECT ${FUNC_PREFIX}.TOK_${entity}('${SMOKE_VAL}')::VARCHAR AS result")
+      TOKEN_VAL=$(echo "$SMOKE_JSON" | jq -r '.[0].RESULT // .[0].result // empty' 2>/dev/null)
+
+      if [[ -z "$TOKEN_VAL" || "$TOKEN_VAL" == "null" ]] || echo "$TOKEN_VAL" | grep -qi "error"; then
+        err "Skyflow tokenize smoke test failed for ${entity}"
+        echo "Tokenize output: ${SMOKE_JSON}"
+        die "Smoke test failed for ${entity}. Check Skyflow credentials and Lambda logs."
+      fi
+      ok "Smoke test: TOK_${entity} succeeded (token=${TOKEN_VAL})"
+
+      # Verify detokenize round-trip
+      DETOK_JSON=$(snow_sql_json "SELECT ${FUNC_PREFIX}.DETOK_${entity}('${TOKEN_VAL}')::VARCHAR AS result")
+      DETOK_VAL=$(echo "$DETOK_JSON" | jq -r '.[0].RESULT // .[0].result // empty' 2>/dev/null)
+
+      if echo "$DETOK_VAL" | grep -qi "${SMOKE_VAL}"; then
+        ok "Smoke test: ${entity} round-trip verified (${SMOKE_VAL} → ${TOKEN_VAL} → ${DETOK_VAL})"
       else
-        warn "Smoke test: detokenize returned unexpected result (may still work)"
+        warn "Smoke test: ${entity} detokenize returned unexpected result (may still work)"
         echo "  Token: ${TOKEN_VAL}"
-        echo "  Detokenize output: ${SMOKE_DETOK}"
+        echo "  Detokenize result: ${DETOK_VAL}"
       fi
-    fi
-
-    # Also verify mock function works (skip in Skyflow mode — Lambda has no mock path when skyflowClient is set)
-    if ! $SKYFLOW_MODE; then
-      SMOKE_MOCK=$(snow_sql "SELECT ${FUNC_PREFIX}.benchmark_detokenize_default('test-token-123') AS result" 2>&1 || true)
-      if echo "$SMOKE_MOCK" | grep -qi "DETOK_"; then
-        ok "Smoke test: mock function also working"
-      else
-        warn "Mock function smoke test returned unexpected result"
-      fi
-    fi
+    done
   else
     # Mock mode smoke test
     SMOKE_RESULT=$(snow_sql "SELECT ${FUNC_PREFIX}.benchmark_detokenize_default('test-token-123') AS result" 2>&1 || true)
@@ -1146,7 +1213,7 @@ ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = 600;
 ALTER SESSION SET USE_CACHED_RESULT = FALSE;
 USE DATABASE ${SF_DB};
 USE WAREHOUSE ${wh};
-SELECT SUM(LENGTH(${FUNC_PREFIX}.${func}(token_value)::VARCHAR)) FROM ${FUNC_PREFIX}.${tbl};
+SELECT SUM(LENGTH(${FUNC_PREFIX}.${func}(tok_name)::VARCHAR)) FROM ${FUNC_PREFIX}.${tbl};
 "
   local QUERY_START_TS
   QUERY_START_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || gdate -u +%Y-%m-%dT%H:%M:%SZ)
@@ -1293,20 +1360,23 @@ print((dt - datetime.timedelta(minutes=2)).strftime('%Y-%m-%dT%H:%M:%SZ'))
 }
 
 # ── run_one_benchmark: runs a single benchmark query and records the result ──
-# Arguments: warehouse table_name rows iteration run_phase
+# Arguments: warehouse table_name rows iteration run_phase [entity]
 run_one_benchmark() {
-  local wh="$1" tbl="$2" rows="$3" iter="$4" run_phase="$5"
-  local size func
+  local wh="$1" tbl="$2" rows="$3" iter="$4" run_phase="$5" entity="${6:-name}"
+  local size func col
 
   size="$(wh_size "$wh")"
 
-  # Probe mode always uses mock function
+  # Probe mode always uses mock function on tok_name column
   if $PROBE; then
     func="benchmark_detokenize_default"
+    col="tok_name"
   elif $SKYFLOW_MODE; then
-    func="benchmark_detokenize"
+    func="DETOK_${entity}"
+    col="tok_${entity}"
   else
     func="benchmark_detokenize_default"
+    col="tok_name"
   fi
 
   # ── Single snowsql session: benchmark + metrics ──
@@ -1323,7 +1393,7 @@ ALTER SESSION SET USE_CACHED_RESULT = FALSE;
 USE DATABASE ${SF_DB};
 USE WAREHOUSE ${wh};
 SELECT COUNT(*) FROM ${FUNC_PREFIX}.${tbl};
-SELECT SUM(LENGTH(${FUNC_PREFIX}.${func}(token_value)::VARCHAR)) FROM ${FUNC_PREFIX}.${tbl};
+SELECT SUM(LENGTH(${FUNC_PREFIX}.${func}(${col})::VARCHAR)) FROM ${FUNC_PREFIX}.${tbl};
 SELECT
   LAST_QUERY_ID() AS QUERY_ID,
   q.TOTAL_ELAPSED_TIME AS SF_ELAPSED_MS
@@ -1391,10 +1461,10 @@ LIMIT 1;
   snow_sql_silent "INSERT INTO ${FUNC_PREFIX}.benchmark_results
     (warehouse_name, warehouse_size, row_count, batch_config, query_id,
      wallclock_ms, sf_elapsed_ms,
-     sf_rows_per_sec, simulated_delay_ms, iteration, run_phase)
+     sf_rows_per_sec, simulated_delay_ms, iteration, run_phase, entity_type)
     VALUES ('${wh}', '${size}', ${rows}, 'default', '${QUERY_ID}',
      ${WALLCLOCK_MS}, ${SF_ELAPSED},
-     ${SF_ROWS_PER_SEC}, ${DELAY_MS}, ${iter}, '${run_phase}')"
+     ${SF_ROWS_PER_SEC}, ${DELAY_MS}, ${iter}, '${run_phase}', '${entity}')"
 
   # Record probe query data for CloudWatch analysis
   if $PROBE; then
@@ -1406,15 +1476,24 @@ LIMIT 1;
   if [[ "$STATUS" != "complete" ]]; then
     STATUS_SUFFIX=" [${STATUS}]"
   fi
-  printf "%-8s | %-18s | %4d/%-4d | %6dms | %6dms | %10d | %s%s\n" \
-    "$wh" "$tbl" "$iter" "$ITERATIONS" "$WALLCLOCK_MS" "$SF_ELAPSED" "$SF_ROWS_PER_SEC" "$run_phase" "$STATUS_SUFFIX"
+  printf "%-8s | %-18s | %-6s | %4d/%-4d | %6dms | %6dms | %10d | %s%s\n" \
+    "$wh" "$tbl" "$entity" "$iter" "$ITERATIONS" "$WALLCLOCK_MS" "$SF_ELAPSED" "$SF_ROWS_PER_SEC" "$run_phase" "$STATUS_SUFFIX"
 }
 
-# Build test matrix
+# Build test matrix (warehouses x tables x entities)
+# In mock/probe mode, only use "name" entity
+if $SKYFLOW_MODE; then
+  BENCH_ENTITIES=("${ENTITIES[@]}")
+else
+  BENCH_ENTITIES=(name)
+fi
+
 declare -a MATRIX=()
 for wh in "${ALL_WAREHOUSES[@]}"; do
   for tbl in "${ALL_TABLES[@]}"; do
-    MATRIX+=("${wh}|${tbl}")
+    for entity in "${BENCH_ENTITIES[@]}"; do
+      MATRIX+=("${wh}|${tbl}|${entity}")
+    done
   done
 done
 
@@ -1425,7 +1504,7 @@ if $PROBE; then
   log "Test matrix: ${TOTAL_COMBOS} combos x ${ITERATIONS} iteration = ${TOTAL_QUERIES} queries (no warmup, 180s timeout)"
 else
   TOTAL_WITH_WARMUP=$(( TOTAL_COMBOS + TOTAL_QUERIES ))
-  log "Test matrix: ${TOTAL_COMBOS} combos x ${ITERATIONS} iterations = ${TOTAL_QUERIES} measured + ${TOTAL_COMBOS} warmups"
+  log "Test matrix: ${TOTAL_COMBOS} combos (${#BENCH_ENTITIES[@]} entities) x ${ITERATIONS} iterations = ${TOTAL_QUERIES} measured + ${TOTAL_COMBOS} warmups"
 fi
 echo ""
 
@@ -1438,7 +1517,7 @@ if $PROBE; then
     "-----------|----------------|----------|------------|--------"
 
   for entry in "${MATRIX[@]}"; do
-    IFS='|' read -r wh tbl <<< "$entry"
+    IFS='|' read -r wh tbl entity <<< "$entry"
     row_var="TABLE_ROWS_${tbl}"
     rows=${!row_var}
 
@@ -1447,28 +1526,28 @@ if $PROBE; then
       probe_concurrency "$wh" "$tbl" "$rows"
     else
       # Small table: run normally for batch size data
-      run_one_benchmark "$wh" "$tbl" "$rows" 1 "measured"
+      run_one_benchmark "$wh" "$tbl" "$rows" 1 "measured" "$entity"
     fi
   done
 else
-  printf "%-8s | %-18s | %-9s | %8s | %8s | %10s | %s\n" \
-    "WH" "TABLE" "ITER" "WALL_MS" "SF_MS" "SF_RPS" "PHASE"
+  printf "%-8s | %-18s | %-6s | %-9s | %8s | %8s | %10s | %s\n" \
+    "WH" "TABLE" "ENTITY" "ITER" "WALL_MS" "SF_MS" "SF_RPS" "PHASE"
   printf "%s\n" \
-    "---------|--------------------|-----------|---------|---------|------------|----------"
+    "---------|--------------------|---------|-----------|---------|---------|-----------|---------"
 
   for entry in "${MATRIX[@]}"; do
-    IFS='|' read -r wh tbl <<< "$entry"
+    IFS='|' read -r wh tbl entity <<< "$entry"
 
     row_var="TABLE_ROWS_${tbl}"
     rows=${!row_var}
 
     # ── Warmup pass (sacrificial, not recorded in measured results) ──
-    log "Warmup: ${wh} x ${tbl}..."
-    run_one_benchmark "$wh" "$tbl" "$rows" 0 "warmup"
+    log "Warmup: ${wh} x ${tbl} x ${entity}..."
+    run_one_benchmark "$wh" "$tbl" "$rows" 0 "warmup" "$entity"
 
     # ── Measured iterations ──
     for iter in $(seq 1 "$ITERATIONS"); do
-      run_one_benchmark "$wh" "$tbl" "$rows" "$iter" "measured"
+      run_one_benchmark "$wh" "$tbl" "$rows" "$iter" "measured" "$entity"
     done
   done
 fi
@@ -1487,12 +1566,14 @@ if $VALIDATE_10B; then
   VALIDATE_ROWS=${TABLE_ROWS_test_tokens_10b}
 
   for wh in "${VALIDATE_WAREHOUSES[@]}"; do
-    # Warmup
-    log "Warmup: ${wh} x ${VALIDATE_TABLE}..."
-    run_one_benchmark "$wh" "$VALIDATE_TABLE" "$VALIDATE_ROWS" 0 "warmup"
+    for entity in "${BENCH_ENTITIES[@]}"; do
+      # Warmup
+      log "Warmup: ${wh} x ${VALIDATE_TABLE} x ${entity}..."
+      run_one_benchmark "$wh" "$VALIDATE_TABLE" "$VALIDATE_ROWS" 0 "warmup" "$entity"
 
-    # Single measured iteration
-    run_one_benchmark "$wh" "$VALIDATE_TABLE" "$VALIDATE_ROWS" 1 "validate_10b"
+      # Single measured iteration
+      run_one_benchmark "$wh" "$VALIDATE_TABLE" "$VALIDATE_ROWS" 1 "validate_10b" "$entity"
+    done
   done
 
   echo ""
@@ -1508,6 +1589,7 @@ echo ""
 log "All Measured Results:"
 snow_sql "SELECT
     warehouse_name AS wh,
+    entity_type AS entity,
     row_count AS num_rows,
     iteration AS iter,
     sf_elapsed_ms AS sf_ms,
@@ -1517,13 +1599,14 @@ snow_sql "SELECT
     query_id
   FROM ${FUNC_PREFIX}.benchmark_results
   WHERE run_phase <> 'warmup' AND simulated_delay_ms = ${DELAY_MS}
-  ORDER BY warehouse_size, row_count, iteration"
+  ORDER BY warehouse_size, row_count, entity_type, iteration"
 echo ""
 
-# ── Statistical summary: median / min / max / spread% per warehouse × table ──
+# ── Statistical summary: median / min / max / spread% per warehouse × table × entity ──
 log "Statistical Summary (median / min / max / spread% across ${ITERATIONS} iterations):"
 snow_sql "SELECT
     warehouse_name AS wh,
+    entity_type AS entity,
     row_count AS num_rows,
     COUNT(*) AS iters,
     ROUND(MEDIAN(sf_rows_per_sec), 0) AS median_rps,
@@ -1539,11 +1622,11 @@ snow_sql "SELECT
     ROUND(MEDIAN(wallclock_ms), 0) AS median_wall_ms
   FROM ${FUNC_PREFIX}.benchmark_results
   WHERE run_phase = 'measured' AND simulated_delay_ms = ${DELAY_MS}
-  GROUP BY warehouse_name, warehouse_size, row_count
-  ORDER BY warehouse_size, row_count"
+  GROUP BY warehouse_name, warehouse_size, entity_type, row_count
+  ORDER BY warehouse_size, entity_type, row_count"
 echo ""
 
-# ── Pivot: median SF rows/sec by warehouse × table ──
+# ── Pivot: median SF rows/sec by warehouse × table (aggregated across entities) ──
 log "Pivot: Median SF Rows/sec by Warehouse (delay=${DELAY_MS}ms):"
 snow_sql "WITH stats AS (
     SELECT
@@ -1573,6 +1656,7 @@ if $VALIDATE_10B; then
   log "10B Validation Results:"
   snow_sql "SELECT
       warehouse_name AS wh,
+      entity_type AS entity,
       row_count AS num_rows,
       sf_elapsed_ms AS sf_ms,
       wallclock_ms AS wall_ms,
@@ -1580,7 +1664,7 @@ if $VALIDATE_10B; then
       query_id
     FROM ${FUNC_PREFIX}.benchmark_results
     WHERE run_phase = 'validate_10b' AND simulated_delay_ms = ${DELAY_MS}
-    ORDER BY warehouse_size"
+    ORDER BY warehouse_size, entity_type"
   echo ""
 fi
 

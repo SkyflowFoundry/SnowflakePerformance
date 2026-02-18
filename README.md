@@ -34,10 +34,13 @@ SF_CONNECTION="default"
 # Skyflow
 SKYFLOW_URL="https://your-vault.skyvault.skyflowapis.com"
 SKYFLOW_API_KEY="your-api-key"
-SKYFLOW_VAULT_ID="your-vault-id"
 SKYFLOW_ACCOUNT_ID="your-account-id"
-SKYFLOW_TABLE="table1"
-SKYFLOW_COLUMN="name"
+SKYFLOW_ENTITIES="name id ssn dob email"
+SKYFLOW_VAULT_ID_NAME="your-name-vault-id"
+SKYFLOW_VAULT_ID_ID="your-id-vault-id"
+SKYFLOW_VAULT_ID_SSN="your-ssn-vault-id"
+SKYFLOW_VAULT_ID_DOB="your-dob-vault-id"
+SKYFLOW_VAULT_ID_EMAIL="your-email-vault-id"
 SKYFLOW_BATCH_SIZE=25
 SKYFLOW_CONCURRENCY=50
 ```
@@ -51,29 +54,31 @@ SKYFLOW_CONCURRENCY=50
 | `SF_CONNECTION` | SnowSQL connection name (as defined in `~/.snowsql/config`) |
 | `SKYFLOW_URL` | Skyflow Data Plane URL (e.g. `https://<id>.skyvault.skyflowapis.com`). When set and `--mock` is not passed, the Lambda calls Skyflow APIs instead of returning mock data |
 | `SKYFLOW_API_KEY` | Skyflow API key (JWT) for authenticating with the Skyflow vault |
-| `SKYFLOW_VAULT_ID` | Skyflow vault ID containing the tokenized data |
 | `SKYFLOW_ACCOUNT_ID` | Skyflow account ID for API authentication |
-| `SKYFLOW_TABLE` | Skyflow vault table name to tokenize/detokenize against |
-| `SKYFLOW_COLUMN` | Skyflow vault column name for the token field |
+| `SKYFLOW_ENTITIES` | Space-separated list of entity types to benchmark (e.g. `name id ssn dob email`) |
+| `SKYFLOW_VAULT_ID_{ENTITY}` | Per-entity vault ID (e.g. `SKYFLOW_VAULT_ID_NAME`, `SKYFLOW_VAULT_ID_SSN`). Each entity uses its own vault with `table1` and a column matching the entity name |
 | `SKYFLOW_BATCH_SIZE` | Number of tokens per Skyflow API call. The Lambda batches tokens from each Snowflake batch into sub-batches of this size |
 | `SKYFLOW_CONCURRENCY` | Max parallel Skyflow API calls per Lambda invocation |
 
 ## Quick Start
 
 ```bash
-# 1. First run — deploys all infra, creates table, runs benchmark
+# 1. First run — deploys all infra, creates table, runs all 5 entities
 ./run_benchmark.sh --rows 5000000 --unique-tokens 500000 --warehouse XL --iterations 2
 
-# 2. Change scale (reuse infra, recreate data only)
+# 2. Single entity — run only name
+./run_benchmark.sh --rows 5000000 --unique-tokens 500000 --warehouse XL --iterations 2 --entity name
+
+# 3. Change scale (reuse infra, recreate data only)
 ./run_benchmark.sh --rows 10000000 --unique-tokens 1000000 --warehouse XL --iterations 3 --skip-deploy
 
-# 3. Re-run same config (reuse everything)
+# 4. Re-run same config (reuse everything)
 ./run_benchmark.sh --rows 10000000 --unique-tokens 1000000 --warehouse XL --iterations 3 --skip-deploy --skip-setup
 
-# 4. Mock mode — pipeline only, no Skyflow
+# 5. Mock mode — pipeline only, no Skyflow
 ./run_benchmark.sh --rows 10000000 --mock --warehouse XL --skip-deploy
 
-# 5. Cleanup
+# 6. Cleanup
 ./run_benchmark.sh --cleanup
 ```
 
@@ -96,12 +101,12 @@ flowchart LR
 
 ### Skyflow mode
 
-When `SKYFLOW_URL` is set (and `--mock` is not passed), the Lambda calls Skyflow APIs for real tokenize/detokenize. Each Lambda deduplicates tokens within its batch before calling Skyflow.
+When `SKYFLOW_URL` is set (and `--mock` is not passed), the Lambda calls Skyflow APIs for real tokenize/detokenize. Each entity (name, id, ssn, dob, email) has its own vault and Snowflake external function pair (`TOK_{entity}` / `DETOK_{entity}`). The `X-Data-Type` header routes each request to the correct vault. Each Lambda deduplicates tokens within its batch before calling Skyflow.
 
 ```mermaid
 flowchart LR
     SF[Snowflake Query] -->|dynamic batch size| EF[External Function]
-    EF -->|POST /process<br/>X-Operation header| AG[API Gateway<br/>Regional REST<br/>AWS_IAM auth]
+    EF -->|POST /process<br/>X-Operation + X-Data-Type| AG[API Gateway<br/>Regional REST<br/>AWS_IAM auth]
     AG --> LM[Lambda<br/>Go · provided.al2023]
     LM -->|deduplicate tokens<br/>within batch| LM
     LM -->|sub-batches of SKYFLOW_BATCH_SIZE<br/>up to SKYFLOW_CONCURRENCY parallel| SKY[Skyflow API<br/>tokenize / detokenize]
@@ -122,7 +127,7 @@ sequenceDiagram
     participant SKY as Skyflow API
     participant CW as CloudWatch
 
-    SF->>SF: SELECT detokenize(token) FROM test_table
+    SF->>SF: SELECT DETOK_name(tok_name) FROM test_table
 
     par Snowflake fans out batches (up to N concurrent Lambdas)
         SF->>AG: POST /process (batch 1)
@@ -199,6 +204,7 @@ Batch Token Dedup Analysis (from 245 METRIC log lines):
 | `--rows N` | *(none)* | Custom table with N rows (overrides tier table selection) |
 | `--unique-tokens N` | *(none)* | Custom unique token count for Skyflow seeding (overrides tier default) |
 | `--warehouse SIZE` | *(none)* | Warehouse size: XS, S, M, L, XL, 2XL, 3XL, 4XL (overrides tier) |
+| `--entity ENTITY` | *(all)* | Run only this entity: name, id, ssn, dob, email (default: all entities) |
 | `--mock` | false | Force mock mode (ignore Skyflow config) |
 | `--skip-deploy` | false | Reuse existing AWS and Snowflake infrastructure (Lambda, API Gateway, IAM, API integration, external functions, warehouses) |
 | `--skip-setup` | false | Reuse existing Snowflake data (tables, token seeding, results table) |

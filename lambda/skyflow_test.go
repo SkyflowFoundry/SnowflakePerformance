@@ -10,7 +10,7 @@ import (
 // Run with real Skyflow credentials:
 //
 //	SKYFLOW_DATA_PLANE_URL=https://lgrkinpzqtda.skyvault.skyflowapis.com \
-//	SKYFLOW_VAULT_ID=b937a5d3be514ee6b0ca5236708be247 \
+//	SKYFLOW_VAULT_ID_NAME=b937a5d3be514ee6b0ca5236708be247 \
 //	SKYFLOW_ACCOUNT_ID=s941db958e8646729eebfe63b1da4198 \
 //	SKYFLOW_API_KEY='<your-jwt>' \
 //	go test -v -run TestSkyflowRoundTrip ./...
@@ -19,9 +19,13 @@ func TestSkyflowRoundTrip(t *testing.T) {
 		t.Skip("SKYFLOW_DATA_PLANE_URL not set — skipping live test")
 	}
 
-	cfg := loadSkyflowConfig()
-	if cfg == nil {
-		t.Fatal("loadSkyflowConfig returned nil")
+	configs := loadSkyflowConfigs()
+	if configs == nil {
+		t.Fatal("loadSkyflowConfigs returned nil")
+	}
+	cfg, ok := configs["NAME"]
+	if !ok {
+		t.Fatal("no NAME config found in loadSkyflowConfigs result")
 	}
 	client := NewSkyflowClient(*cfg)
 	ctx := context.Background()
@@ -34,7 +38,7 @@ func TestSkyflowRoundTrip(t *testing.T) {
 	}
 
 	t.Log("Tokenizing 3 rows...")
-	tokenized, err := client.Tokenize(ctx, tokenizeInput)
+	tokenized, _, err := client.Tokenize(ctx, tokenizeInput)
 	if err != nil {
 		t.Fatalf("Tokenize failed: %v", err)
 	}
@@ -53,7 +57,7 @@ func TestSkyflowRoundTrip(t *testing.T) {
 	}
 
 	t.Log("Detokenizing 3 tokens...")
-	detokenized, err := client.Detokenize(ctx, detokenizeInput)
+	detokenized, _, err := client.Detokenize(ctx, detokenizeInput)
 	if err != nil {
 		t.Fatalf("Detokenize failed: %v", err)
 	}
