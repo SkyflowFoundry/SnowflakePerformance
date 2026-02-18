@@ -601,9 +601,9 @@ POLICY
   if [[ -n "$VPC_ID" && "$VPC_ID" != "None" ]]; then
     ok "Selected VPC: ${VPC_ID}"
     
-    # Find Subnets: Name starts with 'private-app-' (Pick 3)
+    # Find Subnets: Name starts with 'vpc-${REGION}-private-app-' (Pick 3)
     SUBNET_IDS=$(aws_ ec2 describe-subnets --filters "Name=vpc-id,Values=${VPC_ID}" \
-      --query "Subnets[?starts_with(Tags[?Key=='Name'].Value|[0] || '', 'private-app-')].SubnetId" \
+      --query "Subnets[?starts_with(Tags[?Key=='Name'].Value|[0] || '', 'vpc-${REGION}-private-app-')].SubnetId" \
       --output text 2>/dev/null | tr '\t' '\n' | head -3 | tr '\n' ',' | sed 's/,$//')
     
     if [[ -n "$SUBNET_IDS" ]]; then
@@ -622,7 +622,7 @@ POLICY
       
       VPC_CONFIG_ARGS=(--vpc-config "SubnetIds=${SUBNET_IDS},SecurityGroupIds=${SG_ID}")
     else
-      warn "No 'private-app-*' subnets found in ${VPC_ID}. Deploying without VPC config."
+      warn "No vpc-${REGION}-private-app-* subnets found in ${VPC_ID}. Deploying without VPC config."
     fi
   else
     warn "No matching VPC found (non-default, !functions-*). Deploying without VPC config."
