@@ -37,12 +37,17 @@ _require_conf AWS_PROFILE
 _require_conf SF_CONNECTION
 _require_conf SKYFLOW_URL
 _require_conf SKYFLOW_API_KEY
-_require_conf SKYFLOW_VAULT_ID
 _require_conf SKYFLOW_ACCOUNT_ID
-_require_conf SKYFLOW_TABLE
-_require_conf SKYFLOW_COLUMN
+_require_conf SKYFLOW_ENTITIES
 _require_conf SKYFLOW_BATCH_SIZE
 _require_conf SKYFLOW_CONCURRENCY
+
+# Validate per-entity vault IDs
+read -ra ENTITIES <<< "$SKYFLOW_ENTITIES"
+for entity in "${ENTITIES[@]}"; do
+  upper=$(echo "$entity" | tr '[:lower:]' '[:upper:]')
+  _require_conf "SKYFLOW_VAULT_ID_${upper}"
+done
 
 # ─── Runtime flags (not in config file) ──────────────────────────────────────
 SKIP_DEPLOY=false
@@ -54,10 +59,14 @@ MICRO=false
 MEDIUM=false
 INSTALL_PREREQS=false
 ITERATIONS="${ITERATIONS:-3}"
-CONCURRENCY="${CONCURRENCY:-2900}"
+CONCURRENCY="${CONCURRENCY:-4900}"
 VALIDATE_10B=false
 FORCE_MOCK=false
 PROBE=false
+CUSTOM_ROWS="${CUSTOM_ROWS:-}"
+CUSTOM_UNIQUE_TOKENS="${CUSTOM_UNIQUE_TOKENS:-}"
+CUSTOM_WAREHOUSE="${CUSTOM_WAREHOUSE:-}"
+CUSTOM_ENTITY="${CUSTOM_ENTITY:-}"
 
 # Resource naming
 # AWS resources use hyphens, Snowflake uses underscores (SF rejects hyphens in identifiers)
@@ -125,12 +134,16 @@ while [[ $# -gt 0 ]]; do
     --validate-10b) VALIDATE_10B=true; shift ;;
     --mock)                FORCE_MOCK=true; shift ;;
     --probe)               PROBE=true; shift ;;
+    --rows)            CUSTOM_ROWS="$2"; shift 2 ;;
+    --unique-tokens)   CUSTOM_UNIQUE_TOKENS="$2"; shift 2 ;;
+    --warehouse)       CUSTOM_WAREHOUSE="$2"; shift 2 ;;
+    --entity)          CUSTOM_ENTITY="$2"; shift 2 ;;
     -h|--help)
       echo "Usage: $0 [options]"
       echo "  All credentials and IDs are read from benchmark.conf"
       echo ""
-      echo "  --skip-deploy          Reuse existing AWS infrastructure"
-      echo "  --skip-setup           Reuse existing Snowflake objects"
+      echo "  --skip-deploy          Reuse existing AWS and Snowflake infrastructure (Lambda, API Gateway, IAM, API integration, external functions, warehouses)"
+      echo "  --skip-setup           Reuse existing Snowflake data (tables, token seeding, results table)"
       echo "  --cleanup              Tear down everything and exit"
       echo "  --delay-ms MS          Simulated API latency in Lambda (default: 0)"
       echo "  --quick                Reduced test matrix (XL x 10M/100M x 3 iters)"
@@ -138,9 +151,13 @@ while [[ $# -gt 0 ]]; do
       echo "  --micro                Small test matrix (XL x 1K/10K/100K x 1 iter, 25K seeds)"
       echo "  --install-prereqs      Install missing prerequisites via Homebrew/pip"
       echo "  --iterations N         Measured runs per combo (default: 3)"
-      echo "  --concurrency N        Lambda reserved concurrency (default: 2900)"
+      echo "  --concurrency N        Lambda reserved concurrency (default: 4900)"
       echo "  --validate-10b         Append XL/2XL x 10B x 1 iteration after main matrix"
       echo "  --mock                 Force mock mode (ignore Skyflow config)"
+      echo "  --rows N               Custom table with N rows (overrides tier table selection)"
+      echo "  --unique-tokens N      Custom unique token count for Skyflow seeding (overrides tier default)"
+      echo "  --warehouse SIZE       Warehouse size: XS, S, M, L, XL, 2XL, 3XL, 4XL (overrides tier)"
+      echo "  --entity ENTITY        Run only this entity: name, id, ssn, dob, email (default: all)"
       echo "  --probe                Probe mode: measure pipeline fundamentals (batch size,"
       echo "                         concurrency, throughput) with mock-only, time-bounded tests"
       exit 0
@@ -168,6 +185,46 @@ elif $MEDIUM; then
 elif $QUICK; then
   ALL_WAREHOUSES=(BENCH_XL)
   ALL_TABLES=(test_tokens_10m test_tokens_100m)
+fi
+
+# Custom warehouse override (--warehouse SIZE)
+if [[ -n "$CUSTOM_WAREHOUSE" ]]; then
+  case "$CUSTOM_WAREHOUSE" in
+    XS)  ALL_WAREHOUSES=(BENCH_XS) ;;
+    S)   ALL_WAREHOUSES=(BENCH_S) ;;
+    M)   ALL_WAREHOUSES=(BENCH_M) ;;
+    L)   ALL_WAREHOUSES=(BENCH_L) ;;
+    XL)  ALL_WAREHOUSES=(BENCH_XL) ;;
+    2XL) ALL_WAREHOUSES=(BENCH_2XL) ;;
+    3XL) ALL_WAREHOUSES=(BENCH_3XL) ;;
+    4XL) ALL_WAREHOUSES=(BENCH_4XL) ;;
+    *)   echo "ERROR: --warehouse must be one of: XS, S, M, L, XL, 2XL, 3XL, 4XL"; exit 1 ;;
+  esac
+fi
+
+# Custom rows override (--rows N)
+if [[ -n "$CUSTOM_ROWS" ]]; then
+  if ! [[ "$CUSTOM_ROWS" =~ ^[0-9]+$ ]] || [[ "$CUSTOM_ROWS" -lt 1 ]]; then
+    echo "ERROR: --rows must be a positive integer"; exit 1
+  fi
+  ALL_TABLES=(test_tokens_custom)
+  TABLE_ROWS_test_tokens_custom="$CUSTOM_ROWS"
+fi
+
+# Custom entity filter (--entity NAME)
+if [[ -n "$CUSTOM_ENTITY" ]]; then
+  CUSTOM_ENTITY_LOWER=$(echo "$CUSTOM_ENTITY" | tr '[:upper:]' '[:lower:]')
+  # Validate that entity is in SKYFLOW_ENTITIES
+  ENTITY_FOUND=false
+  for e in "${ENTITIES[@]}"; do
+    if [[ "$e" == "$CUSTOM_ENTITY_LOWER" ]]; then
+      ENTITY_FOUND=true; break
+    fi
+  done
+  if ! $ENTITY_FOUND; then
+    echo "ERROR: --entity '${CUSTOM_ENTITY}' not in SKYFLOW_ENTITIES (${SKYFLOW_ENTITIES})"; exit 1
+  fi
+  ENTITIES=("$CUSTOM_ENTITY_LOWER")
 fi
 
 # Skyflow mode determination
@@ -550,12 +607,15 @@ POLICY
   if $SKYFLOW_MODE; then
     LAMBDA_SKYFLOW_ENV=",SKYFLOW_DATA_PLANE_URL=${SKYFLOW_URL}"
     LAMBDA_SKYFLOW_ENV+=",SKYFLOW_API_KEY=${SKYFLOW_API_KEY}"
-    LAMBDA_SKYFLOW_ENV+=",SKYFLOW_VAULT_ID=${SKYFLOW_VAULT_ID}"
     LAMBDA_SKYFLOW_ENV+=",SKYFLOW_ACCOUNT_ID=${SKYFLOW_ACCOUNT_ID}"
-    LAMBDA_SKYFLOW_ENV+=",SKYFLOW_TABLE_NAME=${SKYFLOW_TABLE}"
-    LAMBDA_SKYFLOW_ENV+=",SKYFLOW_COLUMN_NAME=${SKYFLOW_COLUMN}"
     LAMBDA_SKYFLOW_ENV+=",SKYFLOW_BATCH_SIZE=${SKYFLOW_BATCH_SIZE}"
     LAMBDA_SKYFLOW_ENV+=",SKYFLOW_MAX_CONCURRENCY=${SKYFLOW_CONCURRENCY}"
+    # Per-entity vault IDs
+    for entity in "${ENTITIES[@]}"; do
+      upper=$(echo "$entity" | tr '[:lower:]' '[:upper:]')
+      vault_var="SKYFLOW_VAULT_ID_${upper}"
+      LAMBDA_SKYFLOW_ENV+=",SKYFLOW_VAULT_ID_${upper}=${!vault_var}"
+    done
   fi
 
   # Lambda memory/timeout — higher for Skyflow mode (real HTTP calls)
@@ -599,7 +659,12 @@ POLICY
   if $SKYFLOW_MODE; then
     ok "Lambda mode: SKYFLOW (memory=${LAMBDA_MEMORY}MB, timeout=${LAMBDA_TIMEOUT}s)"
     ok "  Skyflow URL: ${SKYFLOW_URL}"
-    ok "  Vault: ${SKYFLOW_VAULT_ID}, Table: ${SKYFLOW_TABLE}, Column: ${SKYFLOW_COLUMN}"
+    ok "  Entities: ${ENTITIES[*]}"
+    for entity in "${ENTITIES[@]}"; do
+      upper=$(echo "$entity" | tr '[:lower:]' '[:upper:]')
+      vault_var="SKYFLOW_VAULT_ID_${upper}"
+      ok "  ${upper}: vault=${!vault_var}"
+    done
     ok "  Batch: ${SKYFLOW_BATCH_SIZE}, Concurrency: ${SKYFLOW_CONCURRENCY}"
   else
     ok "Lambda mode: MOCK"
@@ -739,12 +804,15 @@ fi
 echo ""
 
 ###############################################################################
-# Phase 3: Configure Snowflake
+# Phase 3a: Snowflake Infrastructure
 ###############################################################################
-if $SKIP_SETUP; then
-  log "PHASE 3: Skipping Snowflake setup (--skip-setup)"
+FUNC_PREFIX="${SF_DB}.${SF_SCHEMA}"
+INTEGRATION_NAME="${SF_PREFIX}_api_integration"
+
+if $SKIP_DEPLOY; then
+  log "PHASE 3a: Skipping Snowflake infrastructure (--skip-deploy)"
 else
-  log "PHASE 3: Configuring Snowflake"
+  log "PHASE 3a: Configuring Snowflake infrastructure"
 
   # ── Database and schema ──
   snow_sql_silent "CREATE DATABASE IF NOT EXISTS ${SF_DB}"
@@ -753,7 +821,6 @@ else
 
   # ── API Integration ──
   log "Creating API integration..."
-  INTEGRATION_NAME="${SF_PREFIX}_api_integration"
 
   # Snowflake replaces hyphens — use underscores in the integration name
   snow_sql_silent "CREATE OR REPLACE API INTEGRATION ${INTEGRATION_NAME}
@@ -850,8 +917,6 @@ TRUST
   # ── External functions ──
   log "Creating external functions..."
 
-  FUNC_PREFIX="${SF_DB}.${SF_SCHEMA}"
-
   # Default mock function (backward compatible — always created)
   snow_sql_silent "CREATE OR REPLACE EXTERNAL FUNCTION ${FUNC_PREFIX}.benchmark_detokenize_default(token_value VARCHAR)
     RETURNS VARIANT
@@ -862,23 +927,26 @@ TRUST
   ok "Function: benchmark_detokenize_default"
 
   if $SKYFLOW_MODE; then
-    # Skyflow tokenize function
-    snow_sql_silent "CREATE OR REPLACE EXTERNAL FUNCTION ${FUNC_PREFIX}.benchmark_tokenize(value VARCHAR)
-      RETURNS VARIANT
-      API_INTEGRATION = ${INTEGRATION_NAME}
-      HEADERS = ('X-Operation' = 'tokenize', 'X-Data-Type' = 'NAME', 'X-Vault-Type' = 'HIGH_PERF')
-      CONTEXT_HEADERS = (CURRENT_TIMESTAMP)
-      AS '${API_URL}/process'"
-    ok "Function: benchmark_tokenize"
+    # Per-entity tokenize and detokenize functions
+    for entity in "${ENTITIES[@]}"; do
+      upper=$(echo "$entity" | tr '[:lower:]' '[:upper:]')
 
-    # Skyflow detokenize function
-    snow_sql_silent "CREATE OR REPLACE EXTERNAL FUNCTION ${FUNC_PREFIX}.benchmark_detokenize(token_value VARCHAR)
-      RETURNS VARIANT
-      API_INTEGRATION = ${INTEGRATION_NAME}
-      HEADERS = ('X-Operation' = 'detokenize', 'X-Data-Type' = 'NAME', 'X-Vault-Type' = 'HIGH_PERF')
-      CONTEXT_HEADERS = (CURRENT_TIMESTAMP)
-      AS '${API_URL}/process'"
-    ok "Function: benchmark_detokenize"
+      snow_sql_silent "CREATE OR REPLACE EXTERNAL FUNCTION ${FUNC_PREFIX}.TOK_${entity}(value VARCHAR)
+        RETURNS VARIANT
+        API_INTEGRATION = ${INTEGRATION_NAME}
+        HEADERS = ('X-Operation' = 'tokenize', 'X-Data-Type' = '${upper}')
+        CONTEXT_HEADERS = (CURRENT_TIMESTAMP)
+        AS '${API_URL}/process'"
+      ok "Function: TOK_${entity}"
+
+      snow_sql_silent "CREATE OR REPLACE EXTERNAL FUNCTION ${FUNC_PREFIX}.DETOK_${entity}(token_value VARCHAR)
+        RETURNS VARIANT
+        API_INTEGRATION = ${INTEGRATION_NAME}
+        HEADERS = ('X-Operation' = 'detokenize', 'X-Data-Type' = '${upper}')
+        CONTEXT_HEADERS = (CURRENT_TIMESTAMP)
+        AS '${API_URL}/process'"
+      ok "Function: DETOK_${entity}"
+    done
   fi
 
   # ── Warehouses (create before data gen so we can use a large WH for big tables) ──
@@ -892,8 +960,20 @@ TRUST
       INITIALLY_SUSPENDED = TRUE"
     ok "Warehouse: ${wh} (${size})"
   done
+fi
 
-  # ── Test data (use 2XL if available, else XL, else largest WH for speed) ──
+###############################################################################
+# Phase 3b: Snowflake Data Setup
+###############################################################################
+if $SKIP_SETUP; then
+  log "PHASE 3b: Skipping Snowflake data setup (--skip-setup)"
+  if [[ -n "$CUSTOM_ROWS" ]]; then
+    warn "--rows specified with --skip-setup: table test_tokens_custom must already exist"
+  fi
+else
+  log "PHASE 3b: Setting up Snowflake data"
+
+  # ── Select largest warehouse for data generation ──
   DATA_GEN_WH=""
   for candidate in BENCH_4XL BENCH_3XL BENCH_2XL BENCH_XL BENCH_L BENCH_M BENCH_S BENCH_XS; do
     for wh in "${ALL_WAREHOUSES[@]}"; do
@@ -924,8 +1004,11 @@ TRUST
       CREATE OR REPLACE TABLE ${FUNC_PREFIX}.${tbl} AS
       SELECT
         ${SEQ_FUNC} AS id,
-        UUID_STRING() AS token_value,
-        'extra_data_' || ${SEQ_FUNC}::VARCHAR AS extra_col
+        UUID_STRING() AS tok_name,
+        UUID_STRING() AS tok_id,
+        UUID_STRING() AS tok_ssn,
+        UUID_STRING() AS tok_dob,
+        UUID_STRING() AS tok_email
       FROM TABLE(GENERATOR(ROWCOUNT => ${rows}))"
     ok "Table: ${tbl} (${rows} rows)"
   done
@@ -941,43 +1024,79 @@ TRUST
       SEED_COUNT=25000       # default for quick/full
     fi
 
-    log "Seeding real Skyflow tokens (${SEED_COUNT} unique values)..."
+    if [[ -n "$CUSTOM_UNIQUE_TOKENS" ]]; then
+      if ! [[ "$CUSTOM_UNIQUE_TOKENS" =~ ^[0-9]+$ ]] || [[ "$CUSTOM_UNIQUE_TOKENS" -lt 1 ]]; then
+        echo "ERROR: --unique-tokens must be a positive integer"; exit 1
+      fi
+      SEED_COUNT="$CUSTOM_UNIQUE_TOKENS"
+    fi
 
-    # Generate unique plaintext values
-    snow_sql_silent "USE WAREHOUSE ${DATA_GEN_WH};
-      CREATE OR REPLACE TABLE ${FUNC_PREFIX}.seed_plaintext AS
-      SELECT
-        SEQ4() AS id,
-        'name_' || SEQ4()::VARCHAR AS plaintext_value
-      FROM TABLE(GENERATOR(ROWCOUNT => ${SEED_COUNT}))"
-    ok "Created ${SEED_COUNT} seed plaintext values"
+    log "Seeding real Skyflow tokens (${SEED_COUNT} unique values per entity)..."
 
-    # Tokenize via the benchmark_tokenize function to get real Skyflow tokens
-    log "  Tokenizing ${SEED_COUNT} values via Skyflow..."
-    snow_sql_silent "USE WAREHOUSE ${DATA_GEN_WH};
-      CREATE OR REPLACE TABLE ${FUNC_PREFIX}.seed_tokens AS
-      SELECT
-        id,
-        plaintext_value,
-        ${FUNC_PREFIX}.benchmark_tokenize(plaintext_value)::VARCHAR AS token_value
-      FROM ${FUNC_PREFIX}.seed_plaintext"
-    ok "Tokenized ${SEED_COUNT} values"
+    # Entity offsets for uncorrelated Zipf distributions
+    ENTITY_OFFSET=0
 
-    # Update test tables to use real Skyflow tokens (cycling through seed tokens)
-    for tbl in "${TABLES_TO_GEN[@]}"; do
-      row_var="TABLE_ROWS_${tbl}"
-      rows=${!row_var}
-      log "  Updating ${tbl} with real tokens..."
+    for entity in "${ENTITIES[@]}"; do
+      upper=$(echo "$entity" | tr '[:lower:]' '[:upper:]')
+      ENTITY_OFFSET=$((ENTITY_OFFSET + 1))
+
+      # Generate entity-specific plaintext patterns
+      case "$entity" in
+        name)
+          PLAINTEXT_EXPR="'Person_' || SEQ4()::VARCHAR || ' Smith_' || MOD(SEQ4(), 1000)::VARCHAR"
+          ;;
+        id)
+          PLAINTEXT_EXPR="'ID-' || LPAD(SEQ4()::VARCHAR, 8, '0')"
+          ;;
+        ssn)
+          PLAINTEXT_EXPR="LPAD(MOD(SEQ4(), 900)::VARCHAR + 100, 3, '0') || '-' || LPAD(MOD(SEQ4(), 90)::VARCHAR + 10, 2, '0') || '-' || LPAD(MOD(SEQ4(), 9000)::VARCHAR + 1000, 4, '0')"
+          ;;
+        dob)
+          PLAINTEXT_EXPR="(1950 + MOD(SEQ4(), 56))::VARCHAR || '-' || LPAD((MOD(SEQ4(), 12) + 1)::VARCHAR, 2, '0') || '-' || LPAD((MOD(SEQ4(), 28) + 1)::VARCHAR, 2, '0')"
+          ;;
+        email)
+          PLAINTEXT_EXPR="'user_' || SEQ4()::VARCHAR || '@example' || MOD(SEQ4(), 100)::VARCHAR || '.com'"
+          ;;
+      esac
+
+      log "  Generating seed plaintext for ${entity}..."
       snow_sql_silent "USE WAREHOUSE ${DATA_GEN_WH};
-        UPDATE ${FUNC_PREFIX}.${tbl} t
-        SET t.token_value = s.token_value
-        FROM ${FUNC_PREFIX}.seed_tokens s
-        WHERE MOD(t.id, ${SEED_COUNT}) = s.id"
-      ok "Updated ${tbl} with real Skyflow tokens"
+        CREATE OR REPLACE TABLE ${FUNC_PREFIX}.seed_plaintext_${entity} AS
+        SELECT
+          SEQ4() AS id,
+          ${PLAINTEXT_EXPR} AS plaintext_value
+        FROM TABLE(GENERATOR(ROWCOUNT => ${SEED_COUNT}))"
+      ok "Created ${SEED_COUNT} seed plaintext values for ${entity}"
+
+      log "  Tokenizing ${SEED_COUNT} ${entity} values via Skyflow..."
+      snow_sql_silent "USE WAREHOUSE ${DATA_GEN_WH};
+        CREATE OR REPLACE TABLE ${FUNC_PREFIX}.seed_tokens_${entity} AS
+        SELECT
+          id,
+          plaintext_value,
+          ${FUNC_PREFIX}.TOK_${entity}(plaintext_value)::VARCHAR AS token_value
+        FROM ${FUNC_PREFIX}.seed_plaintext_${entity}"
+      ok "Tokenized ${SEED_COUNT} ${entity} values"
+
+      # Update test tables to use real Skyflow tokens (Zipf s=1 distribution)
+      # Use HASH(t.id + entity_offset) for uncorrelated distributions per entity
+      for tbl in "${TABLES_TO_GEN[@]}"; do
+        row_var="TABLE_ROWS_${tbl}"
+        rows=${!row_var}
+        log "  Updating ${tbl}.tok_${entity} with real tokens (Zipf distribution)..."
+        snow_sql_silent "USE WAREHOUSE ${DATA_GEN_WH};
+          UPDATE ${FUNC_PREFIX}.${tbl} t
+          SET t.tok_${entity} = s.token_value
+          FROM ${FUNC_PREFIX}.seed_tokens_${entity} s
+          WHERE s.id = LEAST(
+            FLOOR(POW(${SEED_COUNT}, ABS(MOD(HASH(t.id + ${ENTITY_OFFSET} * 1000000007), 100000000)) / 100000000.0)) - 1,
+            ${SEED_COUNT} - 1)"
+        ok "Updated ${tbl}.tok_${entity} with real Skyflow tokens"
+      done
     done
   fi
 
-  # ── Results table (with iteration and run_phase columns) ──
+  # ── Results table (with iteration, run_phase, and entity_type columns) ──
   snow_sql_silent "CREATE OR REPLACE TABLE ${FUNC_PREFIX}.benchmark_results (
     test_id VARCHAR DEFAULT UUID_STRING(),
     ts TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
@@ -991,45 +1110,53 @@ TRUST
     sf_rows_per_sec FLOAT,
     simulated_delay_ms INTEGER,
     iteration INTEGER,
-    run_phase VARCHAR
+    run_phase VARCHAR,
+    entity_type VARCHAR
   )"
   ok "Results table created"
 
   # ── Smoke test ──
   log "Running smoke test..."
   if $SKYFLOW_MODE; then
-    # Skyflow mode: tokenize a value, then detokenize the result — verify round-trip
-    log "  Skyflow smoke test: tokenize → detokenize round-trip..."
-    SMOKE_TOKEN=$(snow_sql "SELECT ${FUNC_PREFIX}.benchmark_tokenize('smoke_test_value')::VARCHAR AS result" 2>&1 || true)
-    if echo "$SMOKE_TOKEN" | grep -qi "error\|fail"; then
-      err "Skyflow tokenize smoke test failed"
-      echo "Tokenize output:"
-      echo "$SMOKE_TOKEN"
-      die "Smoke test failed. Check Skyflow credentials and Lambda logs."
-    fi
-    ok "Smoke test: tokenize succeeded"
+    # Skyflow mode: per-entity tokenize → detokenize round-trip
+    # Representative test values per entity type
+    smoke_value_for_entity() {
+      case "$1" in
+        name)  echo "John Smith" ;;
+        id)    echo "ID-00012345" ;;
+        ssn)   echo "123-45-6789" ;;
+        dob)   echo "1990-01-15" ;;
+        email) echo "smoke@example.com" ;;
+      esac
+    }
 
-    # Extract the token value from snowsql table output
-    # Filter: remove border lines (+---+), header (RESULT), empty lines, then strip pipes/spaces
-    TOKEN_VAL=$(echo "$SMOKE_TOKEN" | grep -v '^+\|^$\|RESULT\|result\|row' | grep -v '^\s*|[-]\+|' | tr -d '[:space:]|' | head -1)
-    if [[ -n "$TOKEN_VAL" ]]; then
-      SMOKE_DETOK=$(snow_sql "SELECT ${FUNC_PREFIX}.benchmark_detokenize('${TOKEN_VAL}')::VARCHAR AS result" 2>&1 || true)
-      if echo "$SMOKE_DETOK" | grep -qi "smoke_test_value"; then
-        ok "Smoke test: round-trip verified (tokenize → detokenize = original value)"
-      else
-        warn "Smoke test: detokenize returned unexpected result (may still work)"
-        echo "  Token: ${TOKEN_VAL}"
-        echo "  Detokenize output: ${SMOKE_DETOK}"
+    for entity in "${ENTITIES[@]}"; do
+      SMOKE_VAL=$(smoke_value_for_entity "$entity")
+      log "  Skyflow smoke test: ${entity} (${SMOKE_VAL})..."
+
+      # Use JSON output for reliable token extraction
+      SMOKE_JSON=$(snow_sql_json "SELECT ${FUNC_PREFIX}.TOK_${entity}('${SMOKE_VAL}')::VARCHAR AS result")
+      TOKEN_VAL=$(echo "$SMOKE_JSON" | jq -r '.[0].RESULT // .[0].result // empty' 2>/dev/null)
+
+      if [[ -z "$TOKEN_VAL" || "$TOKEN_VAL" == "null" ]] || echo "$TOKEN_VAL" | grep -qi "error"; then
+        err "Skyflow tokenize smoke test failed for ${entity}"
+        echo "Tokenize output: ${SMOKE_JSON}"
+        die "Smoke test failed for ${entity}. Check Skyflow credentials and Lambda logs."
       fi
-    fi
+      ok "Smoke test: TOK_${entity} succeeded (token=${TOKEN_VAL})"
 
-    # Also verify mock function works
-    SMOKE_MOCK=$(snow_sql "SELECT ${FUNC_PREFIX}.benchmark_detokenize_default('test-token-123') AS result" 2>&1 || true)
-    if echo "$SMOKE_MOCK" | grep -qi "DETOK_"; then
-      ok "Smoke test: mock function also working"
-    else
-      warn "Mock function smoke test returned unexpected result"
-    fi
+      # Verify detokenize round-trip
+      DETOK_JSON=$(snow_sql_json "SELECT ${FUNC_PREFIX}.DETOK_${entity}('${TOKEN_VAL}')::VARCHAR AS result")
+      DETOK_VAL=$(echo "$DETOK_JSON" | jq -r '.[0].RESULT // .[0].result // empty' 2>/dev/null)
+
+      if echo "$DETOK_VAL" | grep -qi "${SMOKE_VAL}"; then
+        ok "Smoke test: ${entity} round-trip verified (${SMOKE_VAL} → ${TOKEN_VAL} → ${DETOK_VAL})"
+      else
+        warn "Smoke test: ${entity} detokenize returned unexpected result (may still work)"
+        echo "  Token: ${TOKEN_VAL}"
+        echo "  Detokenize result: ${DETOK_VAL}"
+      fi
+    done
   else
     # Mock mode smoke test
     SMOKE_RESULT=$(snow_sql "SELECT ${FUNC_PREFIX}.benchmark_detokenize_default('test-token-123') AS result" 2>&1 || true)
@@ -1059,7 +1186,9 @@ MODE_LABEL="mock"
 if $SKYFLOW_MODE; then MODE_LABEL="skyflow"; fi
 log "PHASE 4: Running benchmarks (mode=${MODE_LABEL}, delay=${DELAY_MS}ms, iterations=${ITERATIONS})"
 
-FUNC_PREFIX="${SF_DB}.${SF_SCHEMA}"
+# ── Track benchmark time window for CloudWatch log fetching ──
+BENCH_EARLIEST_START=""
+BENCH_LATEST_END=""
 
 # ── Probe mode: track query timestamps for CloudWatch correlation ──
 if $PROBE; then
@@ -1084,7 +1213,7 @@ ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = 600;
 ALTER SESSION SET USE_CACHED_RESULT = FALSE;
 USE DATABASE ${SF_DB};
 USE WAREHOUSE ${wh};
-SELECT SUM(LENGTH(${FUNC_PREFIX}.${func}(token_value)::VARCHAR)) FROM ${FUNC_PREFIX}.${tbl};
+SELECT SUM(LENGTH(${FUNC_PREFIX}.${func}(tok_name)::VARCHAR)) FROM ${FUNC_PREFIX}.${tbl};
 "
   local QUERY_START_TS
   QUERY_START_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || gdate -u +%Y-%m-%dT%H:%M:%SZ)
@@ -1231,20 +1360,23 @@ print((dt - datetime.timedelta(minutes=2)).strftime('%Y-%m-%dT%H:%M:%SZ'))
 }
 
 # ── run_one_benchmark: runs a single benchmark query and records the result ──
-# Arguments: warehouse table_name rows iteration run_phase
+# Arguments: warehouse table_name rows iteration run_phase [entity]
 run_one_benchmark() {
-  local wh="$1" tbl="$2" rows="$3" iter="$4" run_phase="$5"
-  local size func
+  local wh="$1" tbl="$2" rows="$3" iter="$4" run_phase="$5" entity="${6:-name}"
+  local size func col
 
   size="$(wh_size "$wh")"
 
-  # Probe mode always uses mock function
+  # Probe mode always uses mock function on tok_name column
   if $PROBE; then
     func="benchmark_detokenize_default"
+    col="tok_name"
   elif $SKYFLOW_MODE; then
-    func="benchmark_detokenize"
+    func="DETOK_${entity}"
+    col="tok_${entity}"
   else
     func="benchmark_detokenize_default"
+    col="tok_name"
   fi
 
   # ── Single snowsql session: benchmark + metrics ──
@@ -1261,7 +1393,7 @@ ALTER SESSION SET USE_CACHED_RESULT = FALSE;
 USE DATABASE ${SF_DB};
 USE WAREHOUSE ${wh};
 SELECT COUNT(*) FROM ${FUNC_PREFIX}.${tbl};
-SELECT SUM(LENGTH(${FUNC_PREFIX}.${func}(token_value)::VARCHAR)) FROM ${FUNC_PREFIX}.${tbl};
+SELECT SUM(LENGTH(${FUNC_PREFIX}.${func}(${col})::VARCHAR)) FROM ${FUNC_PREFIX}.${tbl};
 SELECT
   LAST_QUERY_ID() AS QUERY_ID,
   q.TOTAL_ELAPSED_TIME AS SF_ELAPSED_MS
@@ -1283,6 +1415,14 @@ LIMIT 1;
   WALLCLOCK_MS=$(millis_since "$START_NS")
 
   QUERY_END_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || gdate -u +%Y-%m-%dT%H:%M:%SZ)
+
+  # Update benchmark time window for Phase 5 CloudWatch log fetching
+  if [[ -z "$BENCH_EARLIEST_START" ]] || [[ "$QUERY_START_TS" < "$BENCH_EARLIEST_START" ]]; then
+    BENCH_EARLIEST_START="$QUERY_START_TS"
+  fi
+  if [[ -z "$BENCH_LATEST_END" ]] || [[ "$QUERY_END_TS" > "$BENCH_LATEST_END" ]]; then
+    BENCH_LATEST_END="$QUERY_END_TS"
+  fi
 
   # Detect timeout: snowsql error + wall time near 180s
   local STATUS="complete"
@@ -1321,10 +1461,10 @@ LIMIT 1;
   snow_sql_silent "INSERT INTO ${FUNC_PREFIX}.benchmark_results
     (warehouse_name, warehouse_size, row_count, batch_config, query_id,
      wallclock_ms, sf_elapsed_ms,
-     sf_rows_per_sec, simulated_delay_ms, iteration, run_phase)
+     sf_rows_per_sec, simulated_delay_ms, iteration, run_phase, entity_type)
     VALUES ('${wh}', '${size}', ${rows}, 'default', '${QUERY_ID}',
      ${WALLCLOCK_MS}, ${SF_ELAPSED},
-     ${SF_ROWS_PER_SEC}, ${DELAY_MS}, ${iter}, '${run_phase}')"
+     ${SF_ROWS_PER_SEC}, ${DELAY_MS}, ${iter}, '${run_phase}', '${entity}')"
 
   # Record probe query data for CloudWatch analysis
   if $PROBE; then
@@ -1336,15 +1476,24 @@ LIMIT 1;
   if [[ "$STATUS" != "complete" ]]; then
     STATUS_SUFFIX=" [${STATUS}]"
   fi
-  printf "%-8s | %-18s | %4d/%-4d | %6dms | %6dms | %10d | %s%s\n" \
-    "$wh" "$tbl" "$iter" "$ITERATIONS" "$WALLCLOCK_MS" "$SF_ELAPSED" "$SF_ROWS_PER_SEC" "$run_phase" "$STATUS_SUFFIX"
+  printf "%-8s | %-18s | %-6s | %4d/%-4d | %6dms | %6dms | %10d | %s%s\n" \
+    "$wh" "$tbl" "$entity" "$iter" "$ITERATIONS" "$WALLCLOCK_MS" "$SF_ELAPSED" "$SF_ROWS_PER_SEC" "$run_phase" "$STATUS_SUFFIX"
 }
 
-# Build test matrix
+# Build test matrix (warehouses x tables x entities)
+# In mock/probe mode, only use "name" entity
+if $SKYFLOW_MODE; then
+  BENCH_ENTITIES=("${ENTITIES[@]}")
+else
+  BENCH_ENTITIES=(name)
+fi
+
 declare -a MATRIX=()
 for wh in "${ALL_WAREHOUSES[@]}"; do
   for tbl in "${ALL_TABLES[@]}"; do
-    MATRIX+=("${wh}|${tbl}")
+    for entity in "${BENCH_ENTITIES[@]}"; do
+      MATRIX+=("${wh}|${tbl}|${entity}")
+    done
   done
 done
 
@@ -1355,7 +1504,7 @@ if $PROBE; then
   log "Test matrix: ${TOTAL_COMBOS} combos x ${ITERATIONS} iteration = ${TOTAL_QUERIES} queries (no warmup, 180s timeout)"
 else
   TOTAL_WITH_WARMUP=$(( TOTAL_COMBOS + TOTAL_QUERIES ))
-  log "Test matrix: ${TOTAL_COMBOS} combos x ${ITERATIONS} iterations = ${TOTAL_QUERIES} measured + ${TOTAL_COMBOS} warmups"
+  log "Test matrix: ${TOTAL_COMBOS} combos (${#BENCH_ENTITIES[@]} entities) x ${ITERATIONS} iterations = ${TOTAL_QUERIES} measured + ${TOTAL_COMBOS} warmups"
 fi
 echo ""
 
@@ -1368,7 +1517,7 @@ if $PROBE; then
     "-----------|----------------|----------|------------|--------"
 
   for entry in "${MATRIX[@]}"; do
-    IFS='|' read -r wh tbl <<< "$entry"
+    IFS='|' read -r wh tbl entity <<< "$entry"
     row_var="TABLE_ROWS_${tbl}"
     rows=${!row_var}
 
@@ -1377,28 +1526,28 @@ if $PROBE; then
       probe_concurrency "$wh" "$tbl" "$rows"
     else
       # Small table: run normally for batch size data
-      run_one_benchmark "$wh" "$tbl" "$rows" 1 "measured"
+      run_one_benchmark "$wh" "$tbl" "$rows" 1 "measured" "$entity"
     fi
   done
 else
-  printf "%-8s | %-18s | %-9s | %8s | %8s | %10s | %s\n" \
-    "WH" "TABLE" "ITER" "WALL_MS" "SF_MS" "SF_RPS" "PHASE"
+  printf "%-8s | %-18s | %-6s | %-9s | %8s | %8s | %10s | %s\n" \
+    "WH" "TABLE" "ENTITY" "ITER" "WALL_MS" "SF_MS" "SF_RPS" "PHASE"
   printf "%s\n" \
-    "---------|--------------------|-----------|---------|---------+------------|----------"
+    "---------|--------------------|---------|-----------|---------|---------|-----------|---------"
 
   for entry in "${MATRIX[@]}"; do
-    IFS='|' read -r wh tbl <<< "$entry"
+    IFS='|' read -r wh tbl entity <<< "$entry"
 
     row_var="TABLE_ROWS_${tbl}"
     rows=${!row_var}
 
     # ── Warmup pass (sacrificial, not recorded in measured results) ──
-    log "Warmup: ${wh} x ${tbl}..."
-    run_one_benchmark "$wh" "$tbl" "$rows" 0 "warmup"
+    log "Warmup: ${wh} x ${tbl} x ${entity}..."
+    run_one_benchmark "$wh" "$tbl" "$rows" 0 "warmup" "$entity"
 
     # ── Measured iterations ──
     for iter in $(seq 1 "$ITERATIONS"); do
-      run_one_benchmark "$wh" "$tbl" "$rows" "$iter" "measured"
+      run_one_benchmark "$wh" "$tbl" "$rows" "$iter" "measured" "$entity"
     done
   done
 fi
@@ -1417,12 +1566,14 @@ if $VALIDATE_10B; then
   VALIDATE_ROWS=${TABLE_ROWS_test_tokens_10b}
 
   for wh in "${VALIDATE_WAREHOUSES[@]}"; do
-    # Warmup
-    log "Warmup: ${wh} x ${VALIDATE_TABLE}..."
-    run_one_benchmark "$wh" "$VALIDATE_TABLE" "$VALIDATE_ROWS" 0 "warmup"
+    for entity in "${BENCH_ENTITIES[@]}"; do
+      # Warmup
+      log "Warmup: ${wh} x ${VALIDATE_TABLE} x ${entity}..."
+      run_one_benchmark "$wh" "$VALIDATE_TABLE" "$VALIDATE_ROWS" 0 "warmup" "$entity"
 
-    # Single measured iteration
-    run_one_benchmark "$wh" "$VALIDATE_TABLE" "$VALIDATE_ROWS" 1 "validate_10b"
+      # Single measured iteration
+      run_one_benchmark "$wh" "$VALIDATE_TABLE" "$VALIDATE_ROWS" 1 "validate_10b" "$entity"
+    done
   done
 
   echo ""
@@ -1438,6 +1589,7 @@ echo ""
 log "All Measured Results:"
 snow_sql "SELECT
     warehouse_name AS wh,
+    entity_type AS entity,
     row_count AS num_rows,
     iteration AS iter,
     sf_elapsed_ms AS sf_ms,
@@ -1447,13 +1599,14 @@ snow_sql "SELECT
     query_id
   FROM ${FUNC_PREFIX}.benchmark_results
   WHERE run_phase <> 'warmup' AND simulated_delay_ms = ${DELAY_MS}
-  ORDER BY warehouse_size, row_count, iteration"
+  ORDER BY warehouse_size, row_count, entity_type, iteration"
 echo ""
 
-# ── Statistical summary: median / min / max / spread% per warehouse × table ──
+# ── Statistical summary: median / min / max / spread% per warehouse × table × entity ──
 log "Statistical Summary (median / min / max / spread% across ${ITERATIONS} iterations):"
 snow_sql "SELECT
     warehouse_name AS wh,
+    entity_type AS entity,
     row_count AS num_rows,
     COUNT(*) AS iters,
     ROUND(MEDIAN(sf_rows_per_sec), 0) AS median_rps,
@@ -1469,11 +1622,11 @@ snow_sql "SELECT
     ROUND(MEDIAN(wallclock_ms), 0) AS median_wall_ms
   FROM ${FUNC_PREFIX}.benchmark_results
   WHERE run_phase = 'measured' AND simulated_delay_ms = ${DELAY_MS}
-  GROUP BY warehouse_name, warehouse_size, row_count
-  ORDER BY warehouse_size, row_count"
+  GROUP BY warehouse_name, warehouse_size, entity_type, row_count
+  ORDER BY warehouse_size, entity_type, row_count"
 echo ""
 
-# ── Pivot: median SF rows/sec by warehouse × table ──
+# ── Pivot: median SF rows/sec by warehouse × table (aggregated across entities) ──
 log "Pivot: Median SF Rows/sec by Warehouse (delay=${DELAY_MS}ms):"
 snow_sql "WITH stats AS (
     SELECT
@@ -1487,12 +1640,12 @@ snow_sql "WITH stats AS (
   )
   SELECT
     row_count AS num_rows,
-    MAX(CASE WHEN warehouse_name = 'BENCH_XS' THEN ROUND(median_rps, 0) END) AS XS,
-    MAX(CASE WHEN warehouse_name = 'BENCH_M' THEN ROUND(median_rps, 0) END) AS M,
-    MAX(CASE WHEN warehouse_name = 'BENCH_XL' THEN ROUND(median_rps, 0) END) AS XL,
-    MAX(CASE WHEN warehouse_name = 'BENCH_2XL' THEN ROUND(median_rps, 0) END) AS XXL,
-    MAX(CASE WHEN warehouse_name = 'BENCH_3XL' THEN ROUND(median_rps, 0) END) AS XXXL,
-    MAX(CASE WHEN warehouse_name = 'BENCH_4XL' THEN ROUND(median_rps, 0) END) AS XXXXL
+    COALESCE(TO_VARCHAR(MAX(CASE WHEN warehouse_name = 'BENCH_XS' THEN ROUND(median_rps, 0) END)), '-') AS XS,
+    COALESCE(TO_VARCHAR(MAX(CASE WHEN warehouse_name = 'BENCH_M' THEN ROUND(median_rps, 0) END)), '-') AS M,
+    COALESCE(TO_VARCHAR(MAX(CASE WHEN warehouse_name = 'BENCH_XL' THEN ROUND(median_rps, 0) END)), '-') AS XL,
+    COALESCE(TO_VARCHAR(MAX(CASE WHEN warehouse_name = 'BENCH_2XL' THEN ROUND(median_rps, 0) END)), '-') AS XXL,
+    COALESCE(TO_VARCHAR(MAX(CASE WHEN warehouse_name = 'BENCH_3XL' THEN ROUND(median_rps, 0) END)), '-') AS XXXL,
+    COALESCE(TO_VARCHAR(MAX(CASE WHEN warehouse_name = 'BENCH_4XL' THEN ROUND(median_rps, 0) END)), '-') AS XXXXL
   FROM stats
   GROUP BY row_count
   ORDER BY row_count"
@@ -1503,6 +1656,7 @@ if $VALIDATE_10B; then
   log "10B Validation Results:"
   snow_sql "SELECT
       warehouse_name AS wh,
+      entity_type AS entity,
       row_count AS num_rows,
       sf_elapsed_ms AS sf_ms,
       wallclock_ms AS wall_ms,
@@ -1510,7 +1664,7 @@ if $VALIDATE_10B; then
       query_id
     FROM ${FUNC_PREFIX}.benchmark_results
     WHERE run_phase = 'validate_10b' AND simulated_delay_ms = ${DELAY_MS}
-    ORDER BY warehouse_size"
+    ORDER BY warehouse_size, entity_type"
   echo ""
 fi
 
@@ -1577,6 +1731,7 @@ print(int((dt.timestamp() + 120) * 1000))
   ok "Fetched ${METRIC_LINE_COUNT} METRIC log lines"
 
   # ── Parse METRIC logs per query and build pipeline analysis ──
+  echo ""
   log "=== Snowflake → Lambda Pipeline Analysis ==="
   echo ""
   printf "%-10s | %-14s | %-8s | %11s | %9s | %9s | %9s | %10s | %10s | %10s | %8s\n" \
@@ -1676,52 +1831,209 @@ print((dt + datetime.timedelta(minutes=2)).strftime('%Y-%m-%dT%H:%M:%SZ'))
   rm -f "$PROBE_LOG_FILE"
 fi
 
+# ── Batch Token Dedup Analysis (all modes) ──
+if [[ -n "$BENCH_EARLIEST_START" && -n "$BENCH_LATEST_END" ]]; then
+  LOG_GROUP_DEDUP="/aws/lambda/${LAMBDA_NAME}"
+
+  log "Waiting 15s for CloudWatch log propagation..."
+  sleep 15
+
+  # Convert time window to epoch ms (add 2 min buffer each side)
+  if [[ "$(uname)" == "Darwin" ]]; then
+    DEDUP_CW_START_MS=$(python3 -c "
+import datetime
+dt = datetime.datetime.strptime('${BENCH_EARLIEST_START}', '%Y-%m-%dT%H:%M:%SZ')
+dt = dt.replace(tzinfo=datetime.timezone.utc)
+print(int((dt.timestamp() - 120) * 1000))
+")
+    DEDUP_CW_END_MS=$(python3 -c "
+import datetime
+dt = datetime.datetime.strptime('${BENCH_LATEST_END}', '%Y-%m-%dT%H:%M:%SZ')
+dt = dt.replace(tzinfo=datetime.timezone.utc)
+print(int((dt.timestamp() + 120) * 1000))
+")
+  else
+    DEDUP_CW_START_MS=$(( $(date -d "$BENCH_EARLIEST_START" +%s) * 1000 - 120000 ))
+    DEDUP_CW_END_MS=$(( $(date -d "$BENCH_LATEST_END" +%s) * 1000 + 120000 ))
+  fi
+
+  DEDUP_LOG_FILE=$(mktemp)
+  aws_ logs filter-log-events \
+    --log-group-name "$LOG_GROUP_DEDUP" \
+    --start-time "$DEDUP_CW_START_MS" \
+    --end-time "$DEDUP_CW_END_MS" \
+    --filter-pattern "METRIC" \
+    --query 'events[].message' \
+    --output text > "$DEDUP_LOG_FILE" 2>/dev/null || warn "Could not fetch CloudWatch logs for dedup analysis"
+
+  DEDUP_LINE_COUNT=$(wc -l < "$DEDUP_LOG_FILE" | tr -d ' ')
+
+  if [[ "$DEDUP_LINE_COUNT" -gt 0 ]]; then
+    # Parse unique_tokens, batch_size, and skyflow_wall_ms from each METRIC line (portable awk — no gawk extensions)
+    DEDUP_STATS=$(awk '
+      /unique_tokens=[0-9]/ {
+        bs = 0; ut = 0; sw = 0
+        n_fields = split($0, fields, " ")
+        for (i = 1; i <= n_fields; i++) {
+          if (fields[i] ~ /^batch_size=/) { split(fields[i], kv, "="); bs = kv[2]+0 }
+          if (fields[i] ~ /^unique_tokens=/) { split(fields[i], kv, "="); ut = kv[2]+0 }
+          if (fields[i] ~ /^skyflow_wall_ms=/) { split(fields[i], kv, "="); sw = kv[2]+0 }
+        }
+        if (bs > 0) {
+          n++
+          sum_bs += bs
+          sum_ut += ut
+          sum_rep += (bs - ut)
+          sum_dedup += (1 - ut/bs) * 100
+          if (sw > 0) { n_sw++; sum_sf_tps += bs * 1000 / sw }
+        }
+      }
+      END {
+        if (n > 0) {
+          sf_tps = (n_sw > 0) ? sum_sf_tps / n_sw : 0
+          printf "%d %.1f %.1f %.1f %.1f %.0f\n", n, sum_bs/n, sum_ut/n, sum_rep/n, sum_dedup/n, sf_tps
+        } else {
+          printf "0 0 0 0 0 0\n"
+        }
+      }
+    ' "$DEDUP_LOG_FILE")
+
+    DEDUP_N=$(echo "$DEDUP_STATS" | awk '{print $1}')
+    DEDUP_AVG_BS=$(echo "$DEDUP_STATS" | awk '{print $2}')
+    DEDUP_AVG_UT=$(echo "$DEDUP_STATS" | awk '{print $3}')
+    DEDUP_AVG_REP=$(echo "$DEDUP_STATS" | awk '{print $4}')
+    DEDUP_AVG_PCT=$(echo "$DEDUP_STATS" | awk '{print $5}')
+    DEDUP_AVG_SF_TPS=$(echo "$DEDUP_STATS" | awk '{print $6}')
+
+    if [[ "$DEDUP_N" -gt 0 ]]; then
+      printf "  Batch dedup (%s samples): avg_batch=%s  unique=%s  repeated=%s  dedup=%s%%\n" \
+        "$DEDUP_N" "$DEDUP_AVG_BS" "$DEDUP_AVG_UT" "$DEDUP_AVG_REP" "$DEDUP_AVG_PCT"
+      echo ""
+    else
+      warn "No METRIC lines with unique_tokens found in CloudWatch logs"
+      echo ""
+    fi
+  else
+    warn "No METRIC log lines found in CloudWatch (window: ${BENCH_EARLIEST_START} to ${BENCH_LATEST_END})"
+    echo ""
+  fi
+
+  rm -f "$DEDUP_LOG_FILE"
+fi
+
 # ── CloudWatch metrics (best-effort, 60-minute window) ──
 log "CloudWatch Lambda Metrics (last 60 minutes):"
 END_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || gdate -u +%Y-%m-%dT%H:%M:%SZ)
 START_TIME=$(date -u -v-60M +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || gdate -u -d '60 minutes ago' +%Y-%m-%dT%H:%M:%SZ)
 
-echo "  Peak concurrent executions:"
-aws_ cloudwatch get-metric-statistics \
-  --namespace AWS/Lambda \
-  --metric-name ConcurrentExecutions \
+# Fetch all three metrics as JSON
+CW_CONCURRENT=$(aws_ cloudwatch get-metric-statistics \
+  --namespace AWS/Lambda --metric-name ConcurrentExecutions \
   --dimensions Name=FunctionName,Value="${LAMBDA_NAME}" \
-  --start-time "$START_TIME" \
-  --end-time "$END_TIME" \
-  --period 60 \
-  --statistics Maximum \
-  --query 'sort_by(Datapoints, &Timestamp)[-10:].{Time:Timestamp,Max:Maximum}' \
-  --output table 2>/dev/null || warn "Could not fetch ConcurrentExecutions metric"
+  --start-time "$START_TIME" --end-time "$END_TIME" \
+  --period 60 --statistics Maximum --output json 2>/dev/null || echo '{"Datapoints":[]}')
+
+CW_INVOCATIONS=$(aws_ cloudwatch get-metric-statistics \
+  --namespace AWS/Lambda --metric-name Invocations \
+  --dimensions Name=FunctionName,Value="${LAMBDA_NAME}" \
+  --start-time "$START_TIME" --end-time "$END_TIME" \
+  --period 60 --statistics Sum --output json 2>/dev/null || echo '{"Datapoints":[]}')
+
+CW_THROTTLES=$(aws_ cloudwatch get-metric-statistics \
+  --namespace AWS/Lambda --metric-name Throttles \
+  --dimensions Name=FunctionName,Value="${LAMBDA_NAME}" \
+  --start-time "$START_TIME" --end-time "$END_TIME" \
+  --period 60 --statistics Sum --output json 2>/dev/null || echo '{"Datapoints":[]}')
+
+# Merge and format into a compact table
+CW_TABLE=$(jq -r -n \
+  --argjson c "$CW_CONCURRENT" \
+  --argjson i "$CW_INVOCATIONS" \
+  --argjson t "$CW_THROTTLES" '
+  # Collect all timestamps
+  ([$c.Datapoints[].Timestamp, $i.Datapoints[].Timestamp, $t.Datapoints[].Timestamp] | unique) as $times |
+  # Build lookup maps
+  ($c.Datapoints | map({(.Timestamp): .Maximum}) | add // {}) as $cmap |
+  ($i.Datapoints | map({(.Timestamp): .Sum}) | add // {}) as $imap |
+  ($t.Datapoints | map({(.Timestamp): .Sum}) | add // {}) as $tmap |
+  # Sort and output last 10 rows
+  ($times | sort | .[-10:])[] |
+  . as $ts |
+  ($ts | split("T")[1] | split(":")[0:2] | join(":")) as $hm |
+  "\($hm)\t\($cmap[$ts] // "-" | tostring | split(".")[0])\t\($imap[$ts] // "-" | tostring | split(".")[0])\t\($tmap[$ts] // "-" | tostring | split(".")[0])"
+' 2>/dev/null)
+
+if [[ -n "$CW_TABLE" ]]; then
+  printf "  %-18s| %10s | %12s | %9s\n" "TIME (UTC)" "CONCURRENT" "INVOCATIONS" "THROTTLES"
+  printf "  %-18s|%s|%s|%s\n" "------------------" "------------" "--------------" "-----------"
+  while IFS=$'\t' read -r hm conc inv thr; do
+    printf "  %-18s| %10s | %12s | %9s\n" "$hm" "$conc" "$inv" "$thr"
+  done <<< "$CW_TABLE"
+else
+  warn "No CloudWatch metric data available"
+fi
+
+# ── Highlights ──
+CW_PEAK_CONC=$(jq '[.Datapoints[].Maximum] | max // 0 | floor' <<< "$CW_CONCURRENT" 2>/dev/null || echo "-")
+[[ "$CW_PEAK_CONC" == "0" || -z "$CW_PEAK_CONC" ]] && CW_PEAK_CONC="-"
+
+# Query median throughput, rows, and sf elapsed from Snowflake
+# Aliases avoid reserved words (ROWS) and digits in column headers so parsing is safe
+HL_SF_QUERY=$(snow_sql "SELECT ROUND(MEDIAN(sf_rows_per_sec), 0) AS rps, MAX(row_count) AS vol, ROUND(MEDIAN(sf_elapsed_ms), 0) AS sfms FROM ${FUNC_PREFIX}.benchmark_results WHERE run_phase = 'measured' AND simulated_delay_ms = ${DELAY_MS}")
+# Extract first data row: starts with | and contains a digit (skips header + separator lines)
+HL_DATA_LINE=$(echo "$HL_SF_QUERY" | awk '/^[|]/ && /[0-9]/' | head -1)
+HIGHLIGHT_RPS=$(echo "$HL_DATA_LINE" | awk -F'|' '{gsub(/[ ]+/,"",$2); print $2}')
+HL_SF_ROWS=$(echo "$HL_DATA_LINE" | awk -F'|' '{gsub(/[ ]+/,"",$3); print $3}')
+HL_SF_MS=$(echo "$HL_DATA_LINE" | awk -F'|' '{gsub(/[ ]+/,"",$4); print $4}')
+[[ -z "$HIGHLIGHT_RPS" || "$HIGHLIGHT_RPS" == "NULL" ]] && HIGHLIGHT_RPS="-"
+[[ -z "$HL_SF_ROWS" || "$HL_SF_ROWS" == "NULL" ]] && HL_SF_ROWS="-"
+[[ -z "$HL_SF_MS" || "$HL_SF_MS" == "NULL" ]] && HL_SF_MS="-"
+
+# Snowflake avg batch size (rounded to int)
+HL_SF_BATCH=$(printf "%.0f" "${DEDUP_AVG_BS:-0}" 2>/dev/null || echo "-")
+[[ "$HL_SF_BATCH" == "0" || -z "$HL_SF_BATCH" ]] && HL_SF_BATCH="-"
+
+# Skyflow: throughput, total tokens, and dedup from METRIC logs
+HL_SF_TPS="${DEDUP_AVG_SF_TPS:-0}"
+[[ "$HL_SF_TPS" == "0" || -z "$HL_SF_TPS" ]] && HL_SF_TPS="-"
+# Total tokens = invocations * avg batch size
+if [[ "${DEDUP_N:-0}" -gt 0 && "${DEDUP_AVG_BS:-0}" != "0" ]]; then
+  HL_TOTAL_TOKENS=$(awk "BEGIN { printf \"%.0f\", ${DEDUP_N} * ${DEDUP_AVG_BS} }")
+else
+  HL_TOTAL_TOKENS="-"
+fi
+HL_DEDUP_PCT="${DEDUP_AVG_PCT:-"-"}"
+[[ "$HL_DEDUP_PCT" == "0" || -z "$HL_DEDUP_PCT" ]] && HL_DEDUP_PCT="-"
+
+# Format cells with suffixes, falling back to "-" for unavailable values
+HL_FMT="  %-18s| %14s | %25s | %8s | %11s | %s\n"
+HL_SEP="  %-18s|%s|%s|%s|%s|%s\n"
+
+HL_SF_THRU="${HIGHLIGHT_RPS} rows/s"; [[ "$HIGHLIGHT_RPS" == "-" ]] && HL_SF_THRU="-"
+HL_SF_VOL="${HL_SF_ROWS} rows";      [[ "$HL_SF_ROWS" == "-" ]]    && HL_SF_VOL="-"
+HL_SF_DUR="${HL_SF_MS}ms";           [[ "$HL_SF_MS" == "-" ]]      && HL_SF_DUR="-"
+HL_SF_BATCH_STR="avg~${HL_SF_BATCH}"; [[ "$HL_SF_BATCH" == "-" ]] && HL_SF_BATCH_STR="-"
+HL_SF_CONC="${CW_PEAK_CONC} (peak)"; [[ "$CW_PEAK_CONC" == "-" ]] && HL_SF_CONC="-"
 
 echo ""
-echo "  Invocations per minute:"
-aws_ cloudwatch get-metric-statistics \
-  --namespace AWS/Lambda \
-  --metric-name Invocations \
-  --dimensions Name=FunctionName,Value="${LAMBDA_NAME}" \
-  --start-time "$START_TIME" \
-  --end-time "$END_TIME" \
-  --period 60 \
-  --statistics Sum \
-  --query 'sort_by(Datapoints, &Timestamp)[-10:].{Time:Timestamp,Count:Sum}' \
-  --output table 2>/dev/null || warn "Could not fetch Invocations metric"
+log "── Highlights ──────────────────────────────────────────────────────────────────────────"
+printf "$HL_FMT" "PIPELINE" "THROUGHPUT" "VOLUME" "DURATION" "BATCH" "CONCURRENCY"
+printf "$HL_SEP" "------------------" "----------------" "---------------------------" "----------" "-------------" "------------"
+printf "$HL_FMT" "Snowflake -> l" "$HL_SF_THRU" "$HL_SF_VOL" "$HL_SF_DUR" "$HL_SF_BATCH_STR" "$HL_SF_CONC"
+if $SKYFLOW_MODE; then
+  HL_SK_THRU="${HL_SF_TPS} tok/s";  [[ "$HL_SF_TPS" == "-" ]]        && HL_SK_THRU="-"
+  HL_SK_VOL="${HL_TOTAL_TOKENS} tok, ${HL_DEDUP_PCT}%dd"
+  [[ "$HL_TOTAL_TOKENS" == "-" ]] && HL_SK_VOL="-"
+  printf "$HL_FMT" "Lambda -> Skyflow" "$HL_SK_THRU" "$HL_SK_VOL" "-" "${SKYFLOW_BATCH_SIZE:-"-"}" "${SKYFLOW_CONCURRENCY:-"-"}"
+fi
 
 echo ""
-echo "  Throttles:"
-aws_ cloudwatch get-metric-statistics \
-  --namespace AWS/Lambda \
-  --metric-name Throttles \
-  --dimensions Name=FunctionName,Value="${LAMBDA_NAME}" \
-  --start-time "$START_TIME" \
-  --end-time "$END_TIME" \
-  --period 60 \
-  --statistics Sum \
-  --query 'sort_by(Datapoints, &Timestamp)[-10:].{Time:Timestamp,Throttles:Sum}' \
-  --output table 2>/dev/null || warn "Could not fetch Throttles metric"
-
-echo ""
+log "──────────────────────────────────────────────────"
 log "Benchmark complete!"
-log "Results stored in: ${SF_DB}.${SF_SCHEMA}.benchmark_results"
-log "Lambda metrics in CloudWatch: /aws/lambda/${LAMBDA_NAME}"
-log "To re-run with existing infra: $0 --skip-deploy --skip-setup"
-log "To clean up: $0 --cleanup"
+log "Results: ${SF_DB}.${SF_SCHEMA}.benchmark_results"
+log "Logs:    /aws/lambda/${LAMBDA_NAME}"
+echo ""
+log "Next run:"
+log "  Change scale:  $0 --skip-deploy --rows N --unique-tokens N ..."
+log "  Same config:   $0 --skip-deploy --skip-setup"
+log "  Cleanup:       $0 --cleanup"

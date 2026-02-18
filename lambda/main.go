@@ -16,7 +16,7 @@ import (
 var (
 	simulatedDelay  time.Duration
 	invocationCount atomic.Int64
-	skyflowClient   *SkyflowClient
+	skyflowClients  map[string]*SkyflowClient
 )
 
 type sfRequest struct {
@@ -32,12 +32,21 @@ var lambdaInstanceID string
 func init() {
 	lambdaInstanceID = fmt.Sprintf("%d", time.Now().UnixNano())
 
-	// Initialize Skyflow client (nil if SKYFLOW_DATA_PLANE_URL not set → mock mode)
-	skyflowCfg := loadSkyflowConfig()
-	if skyflowCfg != nil {
-		skyflowClient = NewSkyflowClient(*skyflowCfg)
-		log.Printf("INFO: Skyflow mode enabled (url=%s, vault=%s, batch=%d, concurrency=%d)",
-			skyflowCfg.DataPlaneURL, skyflowCfg.VaultID, skyflowCfg.BatchSize, skyflowCfg.MaxConcurrency)
+	// Initialize Skyflow clients (nil map if SKYFLOW_DATA_PLANE_URL not set → mock mode)
+	configs := loadSkyflowConfigs()
+	if configs != nil {
+		skyflowClients = make(map[string]*SkyflowClient, len(configs))
+		for entity, cfg := range configs {
+			skyflowClients[entity] = NewSkyflowClient(*cfg)
+			log.Printf("INFO: Skyflow entity %s enabled (vault=%s, table=%s, column=%s)",
+				entity, cfg.VaultID, cfg.TableName, cfg.ColumnName)
+		}
+		// Log shared settings from first config
+		for _, cfg := range configs {
+			log.Printf("INFO: Skyflow shared settings (url=%s, batch=%d, concurrency=%d)",
+				cfg.DataPlaneURL, cfg.BatchSize, cfg.MaxConcurrency)
+			break
+		}
 	} else {
 		log.Printf("INFO: Mock mode (SKYFLOW_DATA_PLANE_URL not set)")
 	}
@@ -63,6 +72,11 @@ func handler(ctx context.Context, req events.APIGatewayProxyRequest) (events.API
 		operation = "detokenize" // backward compatible
 	}
 	operation = strings.ToLower(operation)
+
+	dataType := strings.ToUpper(lowerHeaders["sf-custom-x-data-type"])
+	if dataType == "" {
+		dataType = "NAME" // backward compatible
+	}
 
 	if queryID == "" {
 		queryID = "unknown"
@@ -90,6 +104,7 @@ func handler(ctx context.Context, req events.APIGatewayProxyRequest) (events.API
 	mode := "mock"
 	var resp sfResponse
 	var skyflowM *SkyflowMetrics
+	skyflowClient := skyflowClients[dataType]
 	if skyflowClient != nil {
 		mode = "skyflow"
 		var respData [][]interface{}
@@ -106,18 +121,25 @@ func handler(ctx context.Context, req events.APIGatewayProxyRequest) (events.API
 			}, nil
 		}
 		if skyflowErr != nil {
-			log.Printf("ERROR: Skyflow %s failed: %v", operation, skyflowErr)
+			log.Printf("ERROR: Skyflow %s (data_type=%s) failed: %v", operation, dataType, skyflowErr)
 			return events.APIGatewayProxyResponse{
 				StatusCode: 500,
 				Body:       fmt.Sprintf(`{"error": "skyflow %s failed: %v"}`, operation, skyflowErr),
 			}, nil
 		}
 		resp = sfResponse{Data: respData}
+	} else if len(skyflowClients) > 0 {
+		// Skyflow mode but no client for this data type
+		return events.APIGatewayProxyResponse{
+			StatusCode: 400,
+			Body:       fmt.Sprintf(`{"error": "no Skyflow client configured for data_type=%s"}`, dataType),
+		}, nil
 	} else {
 		// Mock mode: simulated delay + DETOK_ prefix
 		if simulatedDelay > 0 {
 			time.Sleep(simulatedDelay)
 		}
+		seen := make(map[string]struct{}, batchSize)
 		resp = sfResponse{Data: make([][]interface{}, batchSize)}
 		for i, row := range sfReq.Data {
 			if len(row) < 2 {
@@ -126,27 +148,32 @@ func handler(ctx context.Context, req events.APIGatewayProxyRequest) (events.API
 			}
 			rowNum := row[0]
 			tokenVal := fmt.Sprintf("%v", row[1])
+			seen[tokenVal] = struct{}{}
 			resp.Data[i] = []interface{}{rowNum, "DETOK_" + tokenVal}
+		}
+		uniqueTokens := len(seen)
+		dedupPct := 0.0
+		if batchSize > 0 {
+			dedupPct = (1 - float64(uniqueTokens)/float64(batchSize)) * 100
+		}
+		skyflowM = &SkyflowMetrics{
+			UniqueTokens: uniqueTokens,
+			DedupPct:     dedupPct,
 		}
 	}
 
 	processingDur := time.Now().UnixNano() - receiveTs
 
-	// Log to CloudWatch
-	if skyflowM != nil {
-		lambdaOverheadMs := processingDur/1e6 - skyflowM.SkyflowWallMs
-		log.Printf("METRIC query_id=%s batch_id=%s batch_size=%d operation=%s mode=%s duration_ms=%d "+
-			"unique_tokens=%d dedup_pct=%.1f skyflow_calls=%d skyflow_wall_ms=%d "+
-			"call_min_ms=%d call_avg_ms=%d call_max_ms=%d lambda_overhead_ms=%d errors=%d "+
-			"invocation=%d instance=%s config=%s",
-			queryID, batchID, batchSize, operation, mode, processingDur/1e6,
-			skyflowM.UniqueTokens, skyflowM.DedupPct, skyflowM.SkyflowCalls, skyflowM.SkyflowWallMs,
-			skyflowM.CallMinMs, skyflowM.CallAvgMs, skyflowM.CallMaxMs, lambdaOverheadMs, skyflowM.Errors,
-			invNum, lambdaInstanceID, benchConfig)
-	} else {
-		log.Printf("METRIC query_id=%s batch_id=%s batch_size=%d operation=%s mode=%s duration_ms=%d invocation=%d instance=%s config=%s",
-			queryID, batchID, batchSize, operation, mode, processingDur/1e6, invNum, lambdaInstanceID, benchConfig)
-	}
+	// Log to CloudWatch (skyflowM is always set — both Skyflow and mock modes populate it)
+	lambdaOverheadMs := processingDur/1e6 - skyflowM.SkyflowWallMs
+	log.Printf("METRIC query_id=%s batch_id=%s batch_size=%d operation=%s data_type=%s mode=%s duration_ms=%d "+
+		"unique_tokens=%d dedup_pct=%.1f skyflow_calls=%d skyflow_wall_ms=%d "+
+		"call_min_ms=%d call_avg_ms=%d call_max_ms=%d lambda_overhead_ms=%d errors=%d "+
+		"invocation=%d instance=%s config=%s",
+		queryID, batchID, batchSize, operation, dataType, mode, processingDur/1e6,
+		skyflowM.UniqueTokens, skyflowM.DedupPct, skyflowM.SkyflowCalls, skyflowM.SkyflowWallMs,
+		skyflowM.CallMinMs, skyflowM.CallAvgMs, skyflowM.CallMaxMs, lambdaOverheadMs, skyflowM.Errors,
+		invNum, lambdaInstanceID, benchConfig)
 
 	respBody, err := json.Marshal(resp)
 	if err != nil {
