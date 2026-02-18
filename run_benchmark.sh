@@ -469,6 +469,10 @@ do_cleanup() {
     warn "Lambda delete failed or not found (check --profile flag)"
   fi
 
+  log "Deleting CloudWatch log group..."
+  aws_ logs delete-log-group --log-group-name "/aws/lambda/${LAMBDA_NAME}" > /dev/null 2>&1 || true
+  ok "Log group deleted"
+
   log "Cleaning up IAM roles..."
   # Lambda role
   aws_ iam delete-role-policy --role-name "$LAMBDA_ROLE_NAME" --policy-name "${LAMBDA_ROLE_NAME}-policy" 2>/dev/null || true
@@ -585,6 +589,10 @@ POLICY
   log "Waiting for IAM role propagation..."
   sleep 10
   ok "IAM propagation wait complete"
+
+  # ── CloudWatch Logs ──
+  log "Ensuring CloudWatch log group..."
+  aws_ logs create-log-group --log-group-name "/aws/lambda/${LAMBDA_NAME}" > /dev/null 2>&1 || true
 
   # ── Deploy Lambda ──
   log "Deploying Lambda function..."
