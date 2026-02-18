@@ -493,6 +493,10 @@ do_cleanup() {
     warn "Lambda delete failed or not found (check --profile flag)"
   fi
 
+  log "Deleting CloudWatch log group..."
+  aws_ logs delete-log-group --log-group-name "/aws/lambda/${LAMBDA_NAME}" > /dev/null 2>&1 || true
+  ok "Log group deleted"
+
   log "Cleaning up IAM roles..."
   # Lambda role
   aws_ iam delete-role-policy --role-name "$LAMBDA_ROLE_NAME" --policy-name "${LAMBDA_ROLE_NAME}-policy" 2>/dev/null || true
@@ -581,6 +585,17 @@ else
         "logs:PutLogEvents"
       ],
       "Resource": "arn:aws:logs:${REGION}:${AWS_ACCOUNT_ID}:*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "ec2:CreateNetworkInterface",
+        "ec2:DescribeNetworkInterfaces",
+        "ec2:DeleteNetworkInterface",
+        "ec2:AssignPrivateIpAddresses",
+        "ec2:UnassignPrivateIpAddresses"
+      ],
+      "Resource": "*"
     }
   ]
 }
@@ -599,8 +614,51 @@ POLICY
   sleep 10
   ok "IAM propagation wait complete"
 
+  # ── CloudWatch Logs ──
+  log "Ensuring CloudWatch log group..."
+  aws_ logs create-log-group --log-group-name "/aws/lambda/${LAMBDA_NAME}" > /dev/null 2>&1 || true
+
   # ── Deploy Lambda ──
   log "Deploying Lambda function..."
+
+  # ── Discover VPC/Subnets ──
+  log "Discovering VPC configuration..."
+  # Find VPC: non-default, Name doesn't start with 'functions-'
+  # Uses || '' to handle missing tags gracefully in JMESPath
+  VPC_ID=$(aws_ ec2 describe-vpcs --filters "Name=isDefault,Values=false" \
+    --query "Vpcs[? !starts_with(Tags[?Key=='Name'].Value|[0] || '', 'functions-')].VpcId | [0]" \
+    --output text 2>/dev/null || true)
+
+  VPC_CONFIG_ARGS=()
+  if [[ -n "$VPC_ID" && "$VPC_ID" != "None" ]]; then
+    ok "Selected VPC: ${VPC_ID}"
+    
+    # Find Subnets: Name starts with 'vpc-${REGION}-private-app-' (Pick 3)
+    SUBNET_IDS=$(aws_ ec2 describe-subnets --filters "Name=vpc-id,Values=${VPC_ID}" \
+      --query "Subnets[?starts_with(Tags[?Key=='Name'].Value|[0] || '', 'vpc-${REGION}-private-app-')].SubnetId" \
+      --output text 2>/dev/null | tr '\t' '\n' | head -3 | tr '\n' ',' | sed 's/,$//')
+    
+    if [[ -n "$SUBNET_IDS" ]]; then
+      ok "Selected Subnets: ${SUBNET_IDS}"
+      
+      # Security Group
+      SG_NAME="${AWS_PREFIX}-sg"
+      SG_ID=$(aws_ ec2 describe-security-groups --filters "Name=vpc-id,Values=${VPC_ID}" "Name=group-name,Values=${SG_NAME}" --query "SecurityGroups[0].GroupId" --output text 2>/dev/null || true)
+      
+      if [[ -z "$SG_ID" || "$SG_ID" == "None" ]]; then
+        log "Creating Security Group ${SG_NAME}..."
+        SG_ID=$(aws_ ec2 create-security-group --group-name "${SG_NAME}" --description "Benchmark Lambda SG" --vpc-id "${VPC_ID}" --query "GroupId" --output text 2>/dev/null)
+        # Implicitly allows all outbound traffic (which is usually sufficient for Lambda -> Skyflow/Internet)
+      fi
+      ok "Using Security Group: ${SG_ID}"
+      
+      VPC_CONFIG_ARGS=(--vpc-config "SubnetIds=${SUBNET_IDS},SecurityGroupIds=${SG_ID}")
+    else
+      warn "No vpc-${REGION}-private-app-* subnets found in ${VPC_ID}. Deploying without VPC config."
+    fi
+  else
+    warn "No matching VPC found (non-default, !functions-*). Deploying without VPC config."
+  fi
 
   # Skyflow env vars for Lambda
   LAMBDA_SKYFLOW_ENV=""
@@ -638,6 +696,7 @@ POLICY
     --memory-size "$LAMBDA_MEMORY" \
     --timeout "$LAMBDA_TIMEOUT" \
     --environment "$LAMBDA_ENV_VARS" \
+    "${VPC_CONFIG_ARGS[@]}" \
     > /dev/null 2>&1; then
     ok "Lambda created: ${LAMBDA_NAME}"
   else
@@ -652,6 +711,7 @@ POLICY
       --memory-size "$LAMBDA_MEMORY" \
       --timeout "$LAMBDA_TIMEOUT" \
       --environment "$LAMBDA_ENV_VARS" \
+      "${VPC_CONFIG_ARGS[@]}" \
       > /dev/null 2>&1
     ok "Lambda updated: ${LAMBDA_NAME}"
   fi
