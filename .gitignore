@@ -1,4 +1,5 @@
 benchmark.conf
+elevance.conf
 REPORT*.md
 RESULTS*.md
 lambda/ext-func-benchmark-lambda

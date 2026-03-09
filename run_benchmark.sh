@@ -61,6 +61,10 @@ PROBE=false
 CUSTOM_ROWS="${CUSTOM_ROWS:-}"
 CUSTOM_UNIQUE_TOKENS="${CUSTOM_UNIQUE_TOKENS:-}"
 CUSTOM_WAREHOUSE="${CUSTOM_WAREHOUSE:-}"
+DISTRIBUTION="${DISTRIBUTION:-zipf}"
+SEED_ONLY=false
+SEED_BATCH="${SEED_BATCH:-50000000}"
+SEED_MORE=""
 
 # Resource naming
 # AWS resources use hyphens, Snowflake uses underscores (SF rejects hyphens in identifiers)
@@ -131,6 +135,10 @@ while [[ $# -gt 0 ]]; do
     --rows)            CUSTOM_ROWS="$2"; shift 2 ;;
     --unique-tokens)   CUSTOM_UNIQUE_TOKENS="$2"; shift 2 ;;
     --warehouse)       CUSTOM_WAREHOUSE="$2"; shift 2 ;;
+    --distribution)    DISTRIBUTION="$2"; shift 2 ;;
+    --seed-only)       SEED_ONLY=true; shift ;;
+    --seed-batch)      SEED_BATCH="$2"; shift 2 ;;
+    --seed-more)       SEED_ONLY=true; SEED_MORE="$2"; shift 2 ;;
     -h|--help)
       echo "Usage: $0 [options]"
       echo "  All credentials and IDs are read from benchmark.conf"
@@ -150,6 +158,10 @@ while [[ $# -gt 0 ]]; do
       echo "  --rows N               Custom table with N rows (overrides tier table selection)"
       echo "  --unique-tokens N      Custom unique token count for Skyflow seeding (overrides tier default)"
       echo "  --warehouse SIZE       Warehouse size: XS, S, M, L, XL, 2XL, 3XL, 4XL (overrides tier)"
+      echo "  --distribution TYPE    Token distribution: zipf (default, skewed) or random (uniform)"
+      echo "  --seed-only            Tokenize only: incrementally populate seed_tokens_master and exit"
+      echo "  --seed-more N          Seed N more tokens on top of existing count (implies --seed-only)"
+      echo "  --seed-batch N         Rows per seed batch (default: 50000000). Use with --seed-only"
       echo "  --probe                Probe mode: measure pipeline fundamentals (batch size,"
       echo "                         concurrency, throughput) with mock-only, time-bounded tests"
       exit 0
@@ -194,6 +206,11 @@ if [[ -n "$CUSTOM_WAREHOUSE" ]]; then
   esac
 fi
 
+# Distribution validation
+if [[ "$DISTRIBUTION" != "zipf" && "$DISTRIBUTION" != "random" ]]; then
+  echo "ERROR: --distribution must be 'zipf' or 'random'"; exit 1
+fi
+
 # Custom rows override (--rows N)
 if [[ -n "$CUSTOM_ROWS" ]]; then
   if ! [[ "$CUSTOM_ROWS" =~ ^[0-9]+$ ]] || [[ "$CUSTOM_ROWS" -lt 1 ]]; then
@@ -225,6 +242,11 @@ snow_sql() {
 # Silent version — suppresses all output, for DDL/DML where we don't need results
 snow_sql_silent() {
   snowsql "${SNOWSQL_OPTS[@]}" -o quiet=true -q "$1" "${@:2}" > /dev/null 2>&1
+}
+
+# Returns a single scalar value (no table borders, no headers)
+snow_sql_scalar() {
+  snowsql "${SNOWSQL_OPTS[@]}" -o output_format=tsv -o header=false -q "$1" 2>/dev/null | tr -d '[:space:]'
 }
 
 snow_sql_json() {
@@ -988,6 +1010,104 @@ TRUST
 fi
 
 ###############################################################################
+# Phase 3s: Incremental Token Seeding (--seed-only)
+###############################################################################
+if $SEED_ONLY; then
+  # Pick largest available warehouse for tokenization
+  SEED_WH=""
+  for candidate in BENCH_4XL BENCH_3XL BENCH_2XL BENCH_XL BENCH_L BENCH_M BENCH_S BENCH_XS; do
+    for wh in "${ALL_WAREHOUSES[@]}"; do
+      if [[ "$wh" == "$candidate" ]]; then SEED_WH="$candidate"; break 2; fi
+    done
+  done
+  if [[ -z "$SEED_WH" ]]; then
+    die "No warehouse available for seeding. Run without --skip-deploy first."
+  fi
+
+  # Ensure database, schema, and seed_tokens_master exist before counting
+  snow_sql_silent "CREATE DATABASE IF NOT EXISTS ${SF_DB}"
+  snow_sql_silent "CREATE SCHEMA IF NOT EXISTS ${SF_DB}.${SF_SCHEMA}"
+  snow_sql_silent "CREATE TABLE IF NOT EXISTS ${FUNC_PREFIX}.seed_tokens_master (
+    id NUMBER, plaintext_value VARCHAR, token_value VARCHAR
+  )"
+
+  # Determine target: --seed-more N (incremental) or --unique-tokens N (absolute)
+  if [[ -n "$SEED_MORE" ]]; then
+    CURRENT_COUNT=$(snow_sql_scalar "SELECT COUNT(*) FROM ${FUNC_PREFIX}.seed_tokens_master" || echo "0")
+    CURRENT_COUNT="${CURRENT_COUNT:-0}"
+    SEED_TARGET=$((CURRENT_COUNT + SEED_MORE))
+    log "SEED PHASE: Adding ${SEED_MORE} tokens to existing ${CURRENT_COUNT} (new target: ${SEED_TARGET})"
+  elif [[ -n "$CUSTOM_UNIQUE_TOKENS" ]]; then
+    SEED_TARGET="$CUSTOM_UNIQUE_TOKENS"
+    log "SEED PHASE: Tokenizing to target ${SEED_TARGET} in seed_tokens_master (batch: ${SEED_BATCH})"
+  else
+    die "--seed-only requires --unique-tokens N (total target) or --seed-more N (incremental)"
+  fi
+  log "  Using warehouse: ${SEED_WH}"
+
+  # Step 1: Ensure seed_plaintext exists with enough rows
+  EXISTING_PLAINTEXT=$(snow_sql_scalar "SELECT COUNT(*) FROM ${FUNC_PREFIX}.seed_plaintext" || echo "0")
+  EXISTING_PLAINTEXT="${EXISTING_PLAINTEXT:-0}"
+  if [[ "$EXISTING_PLAINTEXT" -lt "$SEED_TARGET" ]]; then
+    log "  Creating seed_plaintext with ${SEED_TARGET} rows (had ${EXISTING_PLAINTEXT})..."
+    snow_sql_silent "USE WAREHOUSE ${SEED_WH};
+      CREATE OR REPLACE TABLE ${FUNC_PREFIX}.seed_plaintext AS
+      SELECT SEQ4() AS id, 'name_' || SEQ4()::VARCHAR AS plaintext_value
+      FROM TABLE(GENERATOR(ROWCOUNT => ${SEED_TARGET}))"
+    ok "seed_plaintext: ${SEED_TARGET} rows"
+  else
+    ok "seed_plaintext already has ${EXISTING_PLAINTEXT} rows (>= target ${SEED_TARGET})"
+  fi
+
+  # Step 3: Check current progress
+  SEEDED=$(snow_sql_scalar "SELECT COUNT(*) FROM ${FUNC_PREFIX}.seed_tokens_master" || echo "0")
+  SEEDED="${SEEDED:-0}"
+  REMAINING=$((SEED_TARGET - SEEDED))
+  log "  Progress: ${SEEDED} / ${SEED_TARGET} seeded (${REMAINING} remaining)"
+
+  if [[ "$REMAINING" -le 0 ]]; then
+    ok "Token seeding complete! ${SEEDED} tokens in seed_tokens_master."
+    log "  Next: run benchmark with --skip-setup or build test table manually."
+    exit 0
+  fi
+
+  # Step 4: Insert in batches until target reached or interrupted
+  BATCH_NUM=0
+  while [[ "$REMAINING" -gt 0 ]]; do
+    BATCH_NUM=$((BATCH_NUM + 1))
+    BATCH_SIZE=$((REMAINING < SEED_BATCH ? REMAINING : SEED_BATCH))
+    OFFSET="$SEEDED"
+    log "  Batch ${BATCH_NUM}: tokenizing ${BATCH_SIZE} values (offset ${OFFSET})..."
+
+    snowsql "${SNOWSQL_OPTS[@]}" -q "USE WAREHOUSE ${SEED_WH};
+      INSERT INTO ${FUNC_PREFIX}.seed_tokens_master (id, plaintext_value, token_value)
+      SELECT id, plaintext_value,
+        ${FUNC_PREFIX}.benchmark_tokenize(plaintext_value)::VARCHAR AS token_value
+      FROM ${FUNC_PREFIX}.seed_plaintext
+      WHERE id >= ${OFFSET} AND id < ${OFFSET} + ${BATCH_SIZE}" \
+      || { err "Batch ${BATCH_NUM} failed. Progress is saved — re-run to continue."; break; }
+
+    SEEDED=$(snow_sql_scalar "SELECT COUNT(*) FROM ${FUNC_PREFIX}.seed_tokens_master" || echo "0")
+    REMAINING=$((SEED_TARGET - SEEDED))
+    ok "Batch ${BATCH_NUM} done. Progress: ${SEEDED} / ${SEED_TARGET} (${REMAINING} remaining)"
+  done
+
+  if [[ "$REMAINING" -le 0 ]]; then
+    ok "Token seeding complete! ${SEEDED} / ${SEED_TARGET} tokens in seed_tokens_master."
+  else
+    warn "Seeding interrupted. ${SEEDED} / ${SEED_TARGET} tokens saved. Re-run --seed-only to continue."
+  fi
+  log "Seed-only mode: exiting."
+  exit 0
+fi
+
+# Safety net: --seed-only must never reach here
+if $SEED_ONLY; then
+  err "Seed-only phase failed unexpectedly. Exiting."
+  exit 1
+fi
+
+###############################################################################
 # Phase 3b: Snowflake Data Setup
 ###############################################################################
 if $SKIP_SETUP; then
@@ -1055,43 +1175,99 @@ else
 
     log "Seeding real Skyflow tokens (${SEED_COUNT} unique values)..."
 
-    # Generate unique plaintext values
-    snow_sql_silent "USE WAREHOUSE ${DATA_GEN_WH};
-      CREATE OR REPLACE TABLE ${FUNC_PREFIX}.seed_plaintext AS
-      SELECT
-        SEQ4() AS id,
-        'name_' || SEQ4()::VARCHAR AS plaintext_value
-      FROM TABLE(GENERATOR(ROWCOUNT => ${SEED_COUNT}))"
-    ok "Created ${SEED_COUNT} seed plaintext values"
+    # Check if seed_tokens_master has enough pre-seeded tokens
+    MASTER_COUNT=$(snow_sql_scalar "SELECT COUNT(*) FROM ${FUNC_PREFIX}.seed_tokens_master" || echo "0")
+    if [[ "$MASTER_COUNT" -ge "$SEED_COUNT" ]]; then
+      log "  Using pre-seeded seed_tokens_master (${MASTER_COUNT} tokens available, need ${SEED_COUNT})"
+      snow_sql_silent "USE WAREHOUSE ${DATA_GEN_WH};
+        CREATE OR REPLACE TABLE ${FUNC_PREFIX}.seed_tokens AS
+        SELECT id, plaintext_value, token_value
+        FROM ${FUNC_PREFIX}.seed_tokens_master
+        WHERE id < ${SEED_COUNT}"
+      ok "Created seed_tokens from seed_tokens_master (${SEED_COUNT} tokens, no tokenization needed)"
+    else
+      if [[ "$MASTER_COUNT" -gt 0 ]]; then
+        warn "seed_tokens_master has ${MASTER_COUNT} tokens but need ${SEED_COUNT}. Run --seed-only to top up, or falling through to live tokenization..."
+      fi
 
-    # Tokenize via the benchmark_tokenize function to get real Skyflow tokens
-    log "  Tokenizing ${SEED_COUNT} values via Skyflow..."
-    snow_sql_silent "USE WAREHOUSE ${DATA_GEN_WH};
-      CREATE OR REPLACE TABLE ${FUNC_PREFIX}.seed_tokens AS
-      SELECT
-        id,
-        plaintext_value,
-        ${FUNC_PREFIX}.benchmark_tokenize(plaintext_value)::VARCHAR AS token_value
-      FROM ${FUNC_PREFIX}.seed_plaintext"
-    ok "Tokenized ${SEED_COUNT} values"
+      # Generate unique plaintext values
+      snow_sql_silent "USE WAREHOUSE ${DATA_GEN_WH};
+        CREATE OR REPLACE TABLE ${FUNC_PREFIX}.seed_plaintext AS
+        SELECT
+          SEQ4() AS id,
+          'name_' || SEQ4()::VARCHAR AS plaintext_value
+        FROM TABLE(GENERATOR(ROWCOUNT => ${SEED_COUNT}))"
+      ok "Created ${SEED_COUNT} seed plaintext values"
 
-    # Update test tables to use real Skyflow tokens (Zipf s=1 distribution)
-    # Real-world token frequency follows a power law: a small fraction of tokens
-    # (popular customers, frequent products) appear in the majority of rows.
-    # POW(SEED_COUNT, uniform) produces true Zipf (P(k) ∝ 1/k), giving ~15%
-    # intra-batch dedup even at 500M unique tokens with 1K-row batches.
+      # Tokenize via the benchmark_tokenize function to get real Skyflow tokens
+      log "  Tokenizing ${SEED_COUNT} values via Skyflow..."
+      snow_sql_silent "USE WAREHOUSE ${DATA_GEN_WH};
+        CREATE OR REPLACE TABLE ${FUNC_PREFIX}.seed_tokens AS
+        SELECT
+          id,
+          plaintext_value,
+          ${FUNC_PREFIX}.benchmark_tokenize(plaintext_value)::VARCHAR AS token_value
+        FROM ${FUNC_PREFIX}.seed_plaintext"
+      ok "Tokenized ${SEED_COUNT} values"
+    fi
+
+    # Update test tables to use real Skyflow tokens
     for tbl in "${TABLES_TO_GEN[@]}"; do
       row_var="TABLE_ROWS_${tbl}"
       rows=${!row_var}
-      log "  Updating ${tbl} with real tokens (Zipf distribution)..."
-      snow_sql_silent "USE WAREHOUSE ${DATA_GEN_WH};
-        UPDATE ${FUNC_PREFIX}.${tbl} t
-        SET t.token_value = s.token_value
-        FROM ${FUNC_PREFIX}.seed_tokens s
-        WHERE s.id = LEAST(
-          FLOOR(POW(${SEED_COUNT}, ABS(MOD(HASH(t.id), 100000000)) / 100000000.0)) - 1,
-          ${SEED_COUNT} - 1)"
-      ok "Updated ${tbl} with real Skyflow tokens (Zipf distribution)"
+      if [[ "$rows" -eq "$SEED_COUNT" ]]; then
+        # 1:1 mapping: replace the table directly from seed_tokens (avoids Zipf join issues)
+        log "  Rebuilding ${tbl} directly from seed_tokens (1:1, ${rows} rows)..."
+        snow_sql_silent "USE WAREHOUSE ${DATA_GEN_WH};
+          CREATE OR REPLACE TABLE ${FUNC_PREFIX}.${tbl} AS
+          SELECT id, token_value, 'extra_data_' || id::VARCHAR AS extra_col
+          FROM ${FUNC_PREFIX}.seed_tokens"
+        ok "Rebuilt ${tbl} from seed_tokens (1:1 mapping)"
+      else
+        # Rebuild table via JOIN instead of UPDATE to avoid SEQ4/SEQ8 ID misalignment.
+        log "  Rebuilding ${tbl} with real tokens (${DISTRIBUTION} distribution)..."
+
+        # Use SEQ8() for tables > 4.3B rows
+        if [[ $rows -gt 4294967295 ]]; then
+          REBUILD_SEQ="SEQ8()"
+        else
+          REBUILD_SEQ="SEQ4()"
+        fi
+
+        # First ensure seed_tokens has a 0-based sequential ID
+        log "    Creating seed_tokens_indexed..."
+        snowsql "${SNOWSQL_OPTS[@]}" -q "USE WAREHOUSE ${DATA_GEN_WH};
+          CREATE OR REPLACE TABLE ${FUNC_PREFIX}.seed_tokens_indexed AS
+          SELECT ROW_NUMBER() OVER (ORDER BY id) - 1 AS idx, token_value
+          FROM ${FUNC_PREFIX}.seed_tokens" || die "Failed to create seed_tokens_indexed"
+
+        # Build JOIN condition based on distribution type
+        if [[ "$DISTRIBUTION" == "random" ]]; then
+          # Uniform random: MOD(HASH()) evenly distributes across all tokens
+          JOIN_CONDITION="ON s.idx = ABS(MOD(HASH(t.id), ${SEED_COUNT}))"
+        else
+          # Zipf s=1: POW(SEED_COUNT, uniform) produces P(k) ∝ 1/k
+          # Gives ~15% intra-batch dedup even at 500M unique tokens with 1K-row batches
+          JOIN_CONDITION="ON s.idx = LEAST(
+              FLOOR(POW(${SEED_COUNT}, ABS(MOD(HASH(t.id), 100000000)) / 100000000.0)) - 1,
+              ${SEED_COUNT} - 1)"
+        fi
+
+        log "    Rebuilding ${tbl} via ${DISTRIBUTION} JOIN (${rows} rows)..."
+        snowsql "${SNOWSQL_OPTS[@]}" -q "USE WAREHOUSE ${DATA_GEN_WH};
+          CREATE OR REPLACE TABLE ${FUNC_PREFIX}.${tbl} AS
+          SELECT
+            t.id,
+            s.token_value,
+            'extra_data_' || t.id::VARCHAR AS extra_col
+          FROM (
+            SELECT ${REBUILD_SEQ} AS id
+            FROM TABLE(GENERATOR(ROWCOUNT => ${rows}))
+          ) t
+          JOIN ${FUNC_PREFIX}.seed_tokens_indexed s
+            ${JOIN_CONDITION}" || die "Failed to rebuild ${tbl} with ${DISTRIBUTION} distribution"
+        ok "Rebuilt ${tbl} with real Skyflow tokens (${DISTRIBUTION} distribution)"
+      fi
     done
   fi
 
