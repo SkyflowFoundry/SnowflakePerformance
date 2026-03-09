@@ -146,6 +146,9 @@ func NewSkyflowClient(cfg SkyflowConfig) *SkyflowClient {
 		if err != nil {
 			log.Printf("WARN: gRPC connection to %s failed: %v — falling back to REST", cfg.GRPCEndpoint, err)
 		} else {
+			// Force eager TLS handshake during init, not during first request.
+			// This moves cold-start latency (500-2000ms) out of the request path.
+			conn.Connect()
 			sc.flowClient = api.NewFlowServiceClient(conn)
 			log.Printf("INFO: gRPC client initialized (endpoint=%s)", cfg.GRPCEndpoint)
 		}
@@ -190,10 +193,14 @@ func (sc *SkyflowClient) Tokenize(ctx context.Context, rows [][]interface{}) ([]
 			result[i] = []interface{}{i, "ERROR: missing value"}
 			continue
 		}
+		val, ok := row[1].(string)
+		if !ok {
+			val = fmt.Sprintf("%v", row[1])
+		}
 		items = append(items, indexedValue{
 			origIdx:  i,
 			rowIndex: row[0],
-			value:    fmt.Sprintf("%v", row[1]),
+			value:    val,
 		})
 	}
 
@@ -204,41 +211,68 @@ func (sc *SkyflowClient) Tokenize(ctx context.Context, rows [][]interface{}) ([]
 	batches := splitIndexedValues(items, sc.cfg.BatchSize)
 	metrics.SkyflowCalls = len(batches)
 
-	// Process concurrently, collecting per-call latencies
-	sem := make(chan struct{}, sc.cfg.MaxConcurrency)
-	var mu sync.Mutex
-	var wg sync.WaitGroup
 	callLatencies := make([]int64, 0, len(batches))
 
 	skyflowStart := time.Now()
 
-	for _, batch := range batches {
-		wg.Add(1)
-		go func(batch []indexedValue) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-
+	if sc.cfg.MaxConcurrency <= 1 || len(batches) <= 1 {
+		for _, batch := range batches {
 			callStart := time.Now()
 			tokens, err := sc.tokenizeBatch(ctx, batch)
-			callMs := time.Since(callStart).Milliseconds()
-
-			mu.Lock()
-			defer mu.Unlock()
-			callLatencies = append(callLatencies, callMs)
+			callLatencies = append(callLatencies, time.Since(callStart).Milliseconds())
 			if err != nil {
 				metrics.Errors++
+				errMsg := "ERROR: " + err.Error()
 				for _, item := range batch {
-					result[item.origIdx] = []interface{}{item.rowIndex, fmt.Sprintf("ERROR: %v", err)}
+					result[item.origIdx] = []interface{}{item.rowIndex, errMsg}
 				}
-				return
+				continue
 			}
 			for j, item := range batch {
 				result[item.origIdx] = []interface{}{item.rowIndex, tokens[j]}
 			}
-		}(batch)
+		}
+	} else {
+		var mu sync.Mutex
+		var wg sync.WaitGroup
+		useSemaphore := len(batches) > sc.cfg.MaxConcurrency
+		var sem chan struct{}
+		if useSemaphore {
+			sem = make(chan struct{}, sc.cfg.MaxConcurrency)
+		}
+
+		for _, batch := range batches {
+			wg.Add(1)
+			go func(batch []indexedValue) {
+				defer wg.Done()
+				if useSemaphore {
+					sem <- struct{}{}
+					defer func() { <-sem }()
+				}
+
+				callStart := time.Now()
+				tokens, err := sc.tokenizeBatch(ctx, batch)
+				callMs := time.Since(callStart).Milliseconds()
+
+				mu.Lock()
+				callLatencies = append(callLatencies, callMs)
+				if err != nil {
+					metrics.Errors++
+					errMsg := "ERROR: " + err.Error()
+					for _, item := range batch {
+						result[item.origIdx] = []interface{}{item.rowIndex, errMsg}
+					}
+					mu.Unlock()
+					return
+				}
+				for j, item := range batch {
+					result[item.origIdx] = []interface{}{item.rowIndex, tokens[j]}
+				}
+				mu.Unlock()
+			}(batch)
+		}
+		wg.Wait()
 	}
-	wg.Wait()
 
 	metrics.SkyflowWallMs = time.Since(skyflowStart).Milliseconds()
 	computeLatencyStats(metrics, callLatencies)
@@ -312,15 +346,18 @@ func (sc *SkyflowClient) Detokenize(ctx context.Context, rows [][]interface{}) (
 		origIdx  int
 		rowIndex interface{}
 	}
-	tokenMap := make(map[string][]rowRef)
-	var orderedTokens []string
+	tokenMap := make(map[string][]rowRef, len(rows))
+	orderedTokens := make([]string, 0, len(rows))
 
 	for i, row := range rows {
 		if len(row) < 2 {
 			result[i] = []interface{}{i, "ERROR: missing value"}
 			continue
 		}
-		token := fmt.Sprintf("%v", row[1])
+		token, ok := row[1].(string)
+		if !ok {
+			token = fmt.Sprintf("%v", row[1])
+		}
 		refs := tokenMap[token]
 		if len(refs) == 0 {
 			orderedTokens = append(orderedTokens, token)
@@ -337,42 +374,71 @@ func (sc *SkyflowClient) Detokenize(ctx context.Context, rows [][]interface{}) (
 	batches := splitStrings(orderedTokens, sc.cfg.BatchSize)
 	metrics.SkyflowCalls = len(batches)
 
-	// Process concurrently, collecting per-call latencies
-	sem := make(chan struct{}, sc.cfg.MaxConcurrency)
-	var mu sync.Mutex
-	var wg sync.WaitGroup
 	valueMap := make(map[string]string, len(orderedTokens))
 	callLatencies := make([]int64, 0, len(batches))
 
 	skyflowStart := time.Now()
 
-	for _, batch := range batches {
-		wg.Add(1)
-		go func(batch []string) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-
+	if sc.cfg.MaxConcurrency <= 1 || len(batches) <= 1 {
+		// Sequential path — no goroutine overhead
+		for _, batch := range batches {
 			callStart := time.Now()
 			values, err := sc.detokenizeBatch(ctx, batch)
-			callMs := time.Since(callStart).Milliseconds()
-
-			mu.Lock()
-			defer mu.Unlock()
-			callLatencies = append(callLatencies, callMs)
+			callLatencies = append(callLatencies, time.Since(callStart).Milliseconds())
 			if err != nil {
 				metrics.Errors++
+				errMsg := "ERROR: " + err.Error()
 				for _, tok := range batch {
-					valueMap[tok] = fmt.Sprintf("ERROR: %v", err)
+					valueMap[tok] = errMsg
 				}
-				return
+				continue
 			}
 			for i, tok := range batch {
 				valueMap[tok] = values[i]
 			}
-		}(batch)
+		}
+	} else {
+		// Concurrent path
+		var mu sync.Mutex
+		var wg sync.WaitGroup
+		useSemaphore := len(batches) > sc.cfg.MaxConcurrency
+		var sem chan struct{}
+		if useSemaphore {
+			sem = make(chan struct{}, sc.cfg.MaxConcurrency)
+		}
+
+		for _, batch := range batches {
+			wg.Add(1)
+			go func(batch []string) {
+				defer wg.Done()
+				if useSemaphore {
+					sem <- struct{}{}
+					defer func() { <-sem }()
+				}
+
+				callStart := time.Now()
+				values, err := sc.detokenizeBatch(ctx, batch)
+				callMs := time.Since(callStart).Milliseconds()
+
+				mu.Lock()
+				callLatencies = append(callLatencies, callMs)
+				if err != nil {
+					metrics.Errors++
+					errMsg := "ERROR: " + err.Error()
+					for _, tok := range batch {
+						valueMap[tok] = errMsg
+					}
+					mu.Unlock()
+					return
+				}
+				for i, tok := range batch {
+					valueMap[tok] = values[i]
+				}
+				mu.Unlock()
+			}(batch)
+		}
+		wg.Wait()
 	}
-	wg.Wait()
 
 	metrics.SkyflowWallMs = time.Since(skyflowStart).Milliseconds()
 	computeLatencyStats(metrics, callLatencies)
@@ -397,8 +463,10 @@ func (sc *SkyflowClient) detokenizeBatch(ctx context.Context, tokens []string) (
 }
 
 func (sc *SkyflowClient) detokenizeBatchGrpc(ctx context.Context, tokens []string) ([]string, error) {
+	grpcCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
 	md := metadata.Pairs("X-SKYFLOW-ACCOUNT-ID", sc.cfg.AccountID)
-	grpcCtx := metadata.NewOutgoingContext(ctx, md)
+	grpcCtx = metadata.NewOutgoingContext(grpcCtx, md)
 
 	req := &api.FlowDetokenizeRequest{
 		VaultID: sc.cfg.VaultID,
@@ -417,14 +485,9 @@ func (sc *SkyflowClient) detokenizeBatchGrpc(ctx context.Context, tokens []strin
 	values := make([]string, len(tokens))
 	for i, entry := range resp.Response {
 		if entry.Value != nil {
-			strVal, ok := entry.Value.AsInterface().(string)
-			if ok {
-				values[i] = strVal
-			} else {
-				values[i] = fmt.Sprintf("%v", entry.Value.AsInterface())
-			}
+			values[i] = entry.Value.GetStringValue()
 		} else if entry.Error != nil {
-			values[i] = fmt.Sprintf("ERROR: %s", entry.Error.GetValue())
+			values[i] = "ERROR: " + entry.Error.GetValue()
 		} else {
 			values[i] = "ERROR: no value"
 		}
