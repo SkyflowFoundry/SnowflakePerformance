@@ -557,7 +557,9 @@ else
   log "Building Go Lambda binary..."
   (
     cd "${SCRIPT_DIR}/lambda"
-    GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o bootstrap .
+    GOARCH_VAL="amd64"
+    [[ "${LAMBDA_ARCH:-x86_64}" == "arm64" ]] && GOARCH_VAL="arm64"
+    GOPRIVATE=github.com/skyflowapi/* GONOSUMCHECK=github.com/skyflowapi/* GOOS=linux GOARCH="$GOARCH_VAL" CGO_ENABLED=0 go build -o bootstrap .
   )
   (cd "${SCRIPT_DIR}/lambda" && zip -j "${SCRIPT_DIR}/lambda.zip" bootstrap) > /dev/null
   rm -f "${SCRIPT_DIR}/lambda/bootstrap"
@@ -669,17 +671,29 @@ POLICY
     LAMBDA_SKYFLOW_ENV+=",SKYFLOW_COLUMN_NAME=${SKYFLOW_COLUMN}"
     LAMBDA_SKYFLOW_ENV+=",SKYFLOW_BATCH_SIZE=${SKYFLOW_BATCH_SIZE}"
     LAMBDA_SKYFLOW_ENV+=",SKYFLOW_MAX_CONCURRENCY=${SKYFLOW_CONCURRENCY}"
+    if [[ -n "${SKYFLOW_GRPC_ENDPOINT:-}" ]]; then
+      LAMBDA_SKYFLOW_ENV+=",SKYFLOW_GRPC_ENDPOINT=${SKYFLOW_GRPC_ENDPOINT}"
+    fi
   fi
 
-  # Lambda memory/timeout — higher for Skyflow mode (real HTTP calls)
-  LAMBDA_MEMORY=256
-  LAMBDA_TIMEOUT=30
-  if $SKYFLOW_MODE; then
+  # Lambda memory/timeout — use config values if set, else defaults
+  if [[ -n "${LAMBDA_MEMORY:-}" ]]; then
+    : # use value from benchmark.conf
+  elif $SKYFLOW_MODE; then
     LAMBDA_MEMORY=512
+  else
+    LAMBDA_MEMORY=256
+  fi
+  if [[ -n "${LAMBDA_TIMEOUT:-}" ]]; then
+    : # use value from benchmark.conf
+  elif $SKYFLOW_MODE; then
     LAMBDA_TIMEOUT=120
+  else
+    LAMBDA_TIMEOUT=30
   fi
 
   LAMBDA_ENV_VARS="Variables={SIMULATED_DELAY_MS=${DELAY_MS}${LAMBDA_SKYFLOW_ENV}}"
+  LAMBDA_ARCH_ARG="${LAMBDA_ARCH:-x86_64}"
 
   # Try to create; if it exists, update
   if aws_ lambda create-function \
@@ -690,6 +704,7 @@ POLICY
     --zip-file "fileb://${SCRIPT_DIR}/lambda.zip" \
     --memory-size "$LAMBDA_MEMORY" \
     --timeout "$LAMBDA_TIMEOUT" \
+    --architectures "$LAMBDA_ARCH_ARG" \
     --environment "$LAMBDA_ENV_VARS" \
     "${VPC_CONFIG_ARGS[@]}" \
     > /dev/null 2>&1; then
@@ -698,6 +713,7 @@ POLICY
     aws_ lambda update-function-code \
       --function-name "$LAMBDA_NAME" \
       --zip-file "fileb://${SCRIPT_DIR}/lambda.zip" \
+      --architectures "$LAMBDA_ARCH_ARG" \
       > /dev/null 2>&1
     # Wait for update to complete before updating config
     aws_ lambda wait function-updated --function-name "$LAMBDA_NAME" 2>/dev/null || sleep 5

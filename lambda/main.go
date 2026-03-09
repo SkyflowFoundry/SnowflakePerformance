@@ -36,8 +36,8 @@ func init() {
 	skyflowCfg := loadSkyflowConfig()
 	if skyflowCfg != nil {
 		skyflowClient = NewSkyflowClient(*skyflowCfg)
-		log.Printf("INFO: Skyflow mode enabled (url=%s, vault=%s, batch=%d, concurrency=%d)",
-			skyflowCfg.DataPlaneURL, skyflowCfg.VaultID, skyflowCfg.BatchSize, skyflowCfg.MaxConcurrency)
+		log.Printf("INFO: Skyflow mode enabled (url=%s, grpc=%s, vault=%s, batch=%d, concurrency=%d)",
+			skyflowCfg.DataPlaneURL, skyflowCfg.GRPCEndpoint, skyflowCfg.VaultID, skyflowCfg.BatchSize, skyflowCfg.MaxConcurrency)
 	} else {
 		log.Printf("INFO: Mock mode (SKYFLOW_DATA_PLANE_URL not set)")
 	}
