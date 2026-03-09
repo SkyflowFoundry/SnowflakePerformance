@@ -3,25 +3,35 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"time"
+
+	api "github.com/skyflowapi/common/api/v2"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/metadata"
 )
 
 // SkyflowConfig holds environment-driven configuration for the Skyflow v2 API.
 type SkyflowConfig struct {
 	DataPlaneURL string
+	GRPCEndpoint string
+	AccountID    string
 	APIKey       string
 	VaultID      string
 }
 
 // SkyflowClient makes calls to the Skyflow v2 API.
 type SkyflowClient struct {
-	cfg    SkyflowConfig
-	client *http.Client
+	cfg        SkyflowConfig
+	client     *http.Client
+	flowClient api.FlowServiceClient
 }
 
 // loadSkyflowConfig reads Skyflow configuration from environment variables.
@@ -36,19 +46,68 @@ func loadSkyflowConfig() *SkyflowConfig {
 
 	return &SkyflowConfig{
 		DataPlaneURL: url,
+		GRPCEndpoint: os.Getenv("SKYFLOW_GRPC_ENDPOINT"),
+		AccountID:    os.Getenv("SKYFLOW_ACCOUNT_ID"),
 		APIKey:       apiKey,
 		VaultID:      vaultID,
 	}
 }
 
-// NewSkyflowClient creates a client with HTTP connection pooling.
+// basicAuthCreds implements grpc.PerRPCCredentials for Bearer token auth.
+type basicAuthCreds struct {
+	token string
+}
+
+func (b basicAuthCreds) GetRequestMetadata(ctx context.Context, uri ...string) (map[string]string, error) {
+	return map[string]string{
+		"authorization": "Bearer " + b.token,
+	}, nil
+}
+
+func (b basicAuthCreds) RequireTransportSecurity() bool {
+	return false
+}
+
+// NewSkyflowClient creates a client with connection pooling and optional gRPC.
 func NewSkyflowClient(cfg SkyflowConfig) *SkyflowClient {
-	return &SkyflowClient{
+	sc := &SkyflowClient{
 		cfg: cfg,
 		client: &http.Client{
 			Timeout: 30 * time.Second,
+			Transport: &http.Transport{
+				MaxIdleConnsPerHost: 50,
+				MaxIdleConns:        100,
+				IdleConnTimeout:     90 * time.Second,
+			},
 		},
 	}
+
+	// Initialize gRPC client if endpoint is configured
+	if cfg.GRPCEndpoint != "" {
+		// NLB terminates TLS without ALPN h2 negotiation.
+		// grpc-go >= 1.67 enforces ALPN by default — requires GRPC_ENFORCE_ALPN_ENABLED=false
+		// in Lambda environment variables (must be set before grpc package init).
+		conn, err := grpc.NewClient(
+			cfg.GRPCEndpoint,
+			grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{})),
+			grpc.WithPerRPCCredentials(basicAuthCreds{token: cfg.APIKey}),
+			grpc.WithDefaultCallOptions(
+				grpc.MaxCallRecvMsgSize(64*1024*1024),
+				grpc.MaxCallSendMsgSize(64*1024*1024),
+			),
+		)
+		if err != nil {
+			log.Printf("WARN: gRPC connection to %s failed: %v — falling back to REST", cfg.GRPCEndpoint, err)
+		} else {
+			// Force eager TLS handshake during init, not during first request.
+			// This moves cold-start latency (500-2000ms) out of the request path.
+			conn.Connect()
+			sc.flowClient = api.NewFlowServiceClient(conn)
+			log.Printf("INFO: gRPC client initialized (endpoint=%s)", cfg.GRPCEndpoint)
+		}
+	}
+
+	return sc
 }
 
 // --- Detokenize ---
@@ -116,6 +175,51 @@ func (sc *SkyflowClient) Detokenize(ctx context.Context, rows [][]interface{}) (
 }
 
 func (sc *SkyflowClient) detokenizeBatch(ctx context.Context, tokens []string) ([]string, error) {
+	// Use gRPC if available
+	if sc.flowClient != nil {
+		return sc.detokenizeBatchGrpc(ctx, tokens)
+	}
+	return sc.detokenizeBatchREST(ctx, tokens)
+}
+
+func (sc *SkyflowClient) detokenizeBatchGrpc(ctx context.Context, tokens []string) ([]string, error) {
+	md := metadata.Pairs("X-SKYFLOW-ACCOUNT-ID", sc.cfg.AccountID)
+	grpcCtx := metadata.NewOutgoingContext(ctx, md)
+
+	req := &api.FlowDetokenizeRequest{
+		VaultID: sc.cfg.VaultID,
+		Tokens:  tokens,
+	}
+
+	resp, err := sc.flowClient.Detokenize(grpcCtx, req)
+	if err != nil {
+		return nil, fmt.Errorf("detokenize: grpc error: %w", err)
+	}
+
+	if len(resp.Response) != len(tokens) {
+		return nil, fmt.Errorf("detokenize: expected %d entries, got %d", len(tokens), len(resp.Response))
+	}
+
+	values := make([]string, len(tokens))
+	for i, entry := range resp.Response {
+		if entry.Value != nil {
+			strVal, ok := entry.Value.AsInterface().(string)
+			if ok {
+				values[i] = strVal
+			} else {
+				values[i] = fmt.Sprintf("%v", entry.Value.AsInterface())
+			}
+		} else if entry.Error != nil {
+			values[i] = fmt.Sprintf("ERROR: %s", entry.Error.GetValue())
+		} else {
+			values[i] = "ERROR: no value"
+		}
+	}
+
+	return values, nil
+}
+
+func (sc *SkyflowClient) detokenizeBatchREST(ctx context.Context, tokens []string) ([]string, error) {
 	body := detokenizeRequest{
 		VaultID: sc.cfg.VaultID,
 		Tokens:  tokens,
