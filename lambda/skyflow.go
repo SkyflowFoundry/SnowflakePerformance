@@ -6,318 +6,49 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"os"
-	"strconv"
-	"sync"
 	"time"
-
-	"crypto/tls"
-
-	api "github.com/skyflowapi/common/api/v2"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/metadata"
 )
 
 // SkyflowConfig holds environment-driven configuration for the Skyflow v2 API.
 type SkyflowConfig struct {
-	DataPlaneURL   string
-	GRPCEndpoint   string
-	AccountID      string
-	APIKey         string
-	VaultID        string
-	TableName      string
-	ColumnName     string
-	BatchSize      int
-	MaxConcurrency int
+	DataPlaneURL string
+	APIKey       string
+	VaultID      string
 }
 
-// SkyflowMetrics captures per-invocation metrics across all three layers.
-type SkyflowMetrics struct {
-	TotalRows    int   // rows received from Snowflake
-	UniqueTokens int   // unique tokens after dedup (= TotalRows for tokenize)
-	DedupPct     float64 // percent reduction from dedup
-	SkyflowCalls int   // number of Skyflow API sub-batch calls
-	SkyflowWallMs int64 // wall clock ms for all Skyflow work (concurrent)
-	CallMinMs    int64  // fastest individual API call
-	CallMaxMs    int64  // slowest individual API call
-	CallAvgMs    int64  // average individual API call
-	Errors       int   // API errors/retries
-}
-
-// SkyflowClient makes batched, concurrent calls to the Skyflow v2 API.
+// SkyflowClient makes calls to the Skyflow v2 API.
 type SkyflowClient struct {
-	cfg        SkyflowConfig
-	client     *http.Client
-	flowClient api.FlowServiceClient
+	cfg    SkyflowConfig
+	client *http.Client
 }
 
 // loadSkyflowConfig reads Skyflow configuration from environment variables.
-// Returns nil if SKYFLOW_DATA_PLANE_URL is not set (mock mode).
 func loadSkyflowConfig() *SkyflowConfig {
 	url := os.Getenv("SKYFLOW_DATA_PLANE_URL")
-	if url == "" {
+	apiKey := os.Getenv("SKYFLOW_API_KEY")
+	vaultID := os.Getenv("SKYFLOW_VAULT_ID")
+
+	if url == "" || apiKey == "" || vaultID == "" {
 		return nil
 	}
 
-	cfg := &SkyflowConfig{
-		DataPlaneURL:   url,
-		GRPCEndpoint:   os.Getenv("SKYFLOW_GRPC_ENDPOINT"),
-		AccountID:      os.Getenv("SKYFLOW_ACCOUNT_ID"),
-		APIKey:         os.Getenv("SKYFLOW_API_KEY"),
-		VaultID:        os.Getenv("SKYFLOW_VAULT_ID"),
-		TableName:      envOrDefault("SKYFLOW_TABLE_NAME", "table1"),
-		ColumnName:     envOrDefault("SKYFLOW_COLUMN_NAME", "name"),
-		BatchSize:      envIntOrDefault("SKYFLOW_BATCH_SIZE", 25),
-		MaxConcurrency: envIntOrDefault("SKYFLOW_MAX_CONCURRENCY", 10),
+	return &SkyflowConfig{
+		DataPlaneURL: url,
+		APIKey:       apiKey,
+		VaultID:      vaultID,
 	}
-
-	if cfg.APIKey == "" {
-		log.Printf("WARN: SKYFLOW_DATA_PLANE_URL set but SKYFLOW_API_KEY missing — Skyflow calls will fail")
-	}
-	if cfg.VaultID == "" {
-		log.Printf("WARN: SKYFLOW_DATA_PLANE_URL set but SKYFLOW_VAULT_ID missing — Skyflow calls will fail")
-	}
-
-	return cfg
 }
 
-func envOrDefault(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
-}
-
-func envIntOrDefault(key string, fallback int) int {
-	if v := os.Getenv(key); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			return n
-		}
-	}
-	return fallback
-}
-
-// basicAuthCreds implements grpc.PerRPCCredentials for Bearer token auth.
-type basicAuthCreds struct {
-	token string
-}
-
-func (b basicAuthCreds) GetRequestMetadata(ctx context.Context, uri ...string) (map[string]string, error) {
-	return map[string]string{
-		"authorization": "Bearer " + b.token,
-	}, nil
-}
-
-func (b basicAuthCreds) RequireTransportSecurity() bool {
-	return false
-}
-
-// NewSkyflowClient creates a client with connection pooling and optional gRPC.
+// NewSkyflowClient creates a client with HTTP connection pooling.
 func NewSkyflowClient(cfg SkyflowConfig) *SkyflowClient {
-	sc := &SkyflowClient{
+	return &SkyflowClient{
 		cfg: cfg,
 		client: &http.Client{
 			Timeout: 30 * time.Second,
-			Transport: &http.Transport{
-				MaxIdleConnsPerHost: 50,
-				MaxIdleConns:        100,
-				IdleConnTimeout:     90 * time.Second,
-			},
 		},
 	}
-
-	// Initialize gRPC client if endpoint is configured
-	if cfg.GRPCEndpoint != "" {
-		// NLB terminates TLS without ALPN h2 negotiation.
-		// grpc-go >= 1.67 enforces ALPN by default — requires GRPC_ENFORCE_ALPN_ENABLED=false
-		// in Lambda environment variables (must be set before grpc package init).
-		conn, err := grpc.NewClient(
-			cfg.GRPCEndpoint,
-			grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{})),
-			grpc.WithPerRPCCredentials(basicAuthCreds{token: cfg.APIKey}),
-			grpc.WithDefaultCallOptions(
-				grpc.MaxCallRecvMsgSize(64*1024*1024),
-				grpc.MaxCallSendMsgSize(64*1024*1024),
-			),
-		)
-		if err != nil {
-			log.Printf("WARN: gRPC connection to %s failed: %v — falling back to REST", cfg.GRPCEndpoint, err)
-		} else {
-			// Force eager TLS handshake during init, not during first request.
-			// This moves cold-start latency (500-2000ms) out of the request path.
-			conn.Connect()
-			sc.flowClient = api.NewFlowServiceClient(conn)
-			log.Printf("INFO: gRPC client initialized (endpoint=%s)", cfg.GRPCEndpoint)
-		}
-	}
-
-	return sc
-}
-
-// --- Tokenize ---
-
-type tokenizeRequest struct {
-	VaultID   string              `json:"vaultID"`
-	TableName string              `json:"tableName"`
-	Records   []tokenizeRecordReq `json:"records"`
-}
-
-type tokenizeRecordReq struct {
-	Data map[string]string `json:"data"`
-}
-
-type tokenizeResponse struct {
-	Records []tokenizeRecordResp `json:"records"`
-}
-
-type tokenizeRecordResp struct {
-	Tokens map[string][]tokenEntry `json:"tokens"`
-}
-
-type tokenEntry struct {
-	Token string `json:"token"`
-}
-
-// Tokenize sends values to Skyflow for tokenization.
-func (sc *SkyflowClient) Tokenize(ctx context.Context, rows [][]interface{}) ([][]interface{}, *SkyflowMetrics, error) {
-	result := make([][]interface{}, len(rows))
-	metrics := &SkyflowMetrics{TotalRows: len(rows)}
-
-	// Extract row indices and values
-	items := make([]indexedValue, 0, len(rows))
-	for i, row := range rows {
-		if len(row) < 2 {
-			result[i] = []interface{}{i, "ERROR: missing value"}
-			continue
-		}
-		val, ok := row[1].(string)
-		if !ok {
-			val = fmt.Sprintf("%v", row[1])
-		}
-		items = append(items, indexedValue{
-			origIdx:  i,
-			rowIndex: row[0],
-			value:    val,
-		})
-	}
-
-	metrics.UniqueTokens = len(items) // no dedup for tokenize
-	metrics.DedupPct = 0
-
-	// Split into sub-batches
-	batches := splitIndexedValues(items, sc.cfg.BatchSize)
-	metrics.SkyflowCalls = len(batches)
-
-	callLatencies := make([]int64, 0, len(batches))
-
-	skyflowStart := time.Now()
-
-	if sc.cfg.MaxConcurrency <= 1 || len(batches) <= 1 {
-		for _, batch := range batches {
-			callStart := time.Now()
-			tokens, err := sc.tokenizeBatch(ctx, batch)
-			callLatencies = append(callLatencies, time.Since(callStart).Milliseconds())
-			if err != nil {
-				metrics.Errors++
-				errMsg := "ERROR: " + err.Error()
-				for _, item := range batch {
-					result[item.origIdx] = []interface{}{item.rowIndex, errMsg}
-				}
-				continue
-			}
-			for j, item := range batch {
-				result[item.origIdx] = []interface{}{item.rowIndex, tokens[j]}
-			}
-		}
-	} else {
-		var mu sync.Mutex
-		var wg sync.WaitGroup
-		useSemaphore := len(batches) > sc.cfg.MaxConcurrency
-		var sem chan struct{}
-		if useSemaphore {
-			sem = make(chan struct{}, sc.cfg.MaxConcurrency)
-		}
-
-		for _, batch := range batches {
-			wg.Add(1)
-			go func(batch []indexedValue) {
-				defer wg.Done()
-				if useSemaphore {
-					sem <- struct{}{}
-					defer func() { <-sem }()
-				}
-
-				callStart := time.Now()
-				tokens, err := sc.tokenizeBatch(ctx, batch)
-				callMs := time.Since(callStart).Milliseconds()
-
-				mu.Lock()
-				callLatencies = append(callLatencies, callMs)
-				if err != nil {
-					metrics.Errors++
-					errMsg := "ERROR: " + err.Error()
-					for _, item := range batch {
-						result[item.origIdx] = []interface{}{item.rowIndex, errMsg}
-					}
-					mu.Unlock()
-					return
-				}
-				for j, item := range batch {
-					result[item.origIdx] = []interface{}{item.rowIndex, tokens[j]}
-				}
-				mu.Unlock()
-			}(batch)
-		}
-		wg.Wait()
-	}
-
-	metrics.SkyflowWallMs = time.Since(skyflowStart).Milliseconds()
-	computeLatencyStats(metrics, callLatencies)
-
-	return result, metrics, nil
-}
-
-func (sc *SkyflowClient) tokenizeBatch(ctx context.Context, items []indexedValue) ([]string, error) {
-	records := make([]tokenizeRecordReq, len(items))
-	for i, item := range items {
-		records[i] = tokenizeRecordReq{
-			Data: map[string]string{sc.cfg.ColumnName: item.value},
-		}
-	}
-
-	body := tokenizeRequest{
-		VaultID:   sc.cfg.VaultID,
-		TableName: sc.cfg.TableName,
-		Records:   records,
-	}
-
-	respBody, err := sc.doWithRetry(ctx, sc.cfg.DataPlaneURL+"/v2/records/insert", body)
-	if err != nil {
-		return nil, err
-	}
-
-	var resp tokenizeResponse
-	if err := json.Unmarshal(respBody, &resp); err != nil {
-		return nil, fmt.Errorf("tokenize: unmarshal response: %w", err)
-	}
-
-	if len(resp.Records) != len(items) {
-		return nil, fmt.Errorf("tokenize: expected %d records, got %d", len(items), len(resp.Records))
-	}
-
-	tokens := make([]string, len(items))
-	for i, rec := range resp.Records {
-		entries, ok := rec.Tokens[sc.cfg.ColumnName]
-		if !ok || len(entries) == 0 {
-			return nil, fmt.Errorf("tokenize: no token for column %q in record %d", sc.cfg.ColumnName, i)
-		}
-		tokens[i] = entries[0].Token
-	}
-
-	return tokens, nil
 }
 
 // --- Detokenize ---
@@ -337,27 +68,23 @@ type detokenizeEntry struct {
 }
 
 // Detokenize sends tokens to Skyflow for detokenization with deduplication.
-func (sc *SkyflowClient) Detokenize(ctx context.Context, rows [][]interface{}) ([][]interface{}, *SkyflowMetrics, error) {
+func (sc *SkyflowClient) Detokenize(ctx context.Context, rows [][]interface{}) ([][]interface{}, error) {
 	result := make([][]interface{}, len(rows))
-	metrics := &SkyflowMetrics{TotalRows: len(rows)}
 
 	// Build dedup map: token → list of (origIdx, rowIndex)
 	type rowRef struct {
 		origIdx  int
 		rowIndex interface{}
 	}
-	tokenMap := make(map[string][]rowRef, len(rows))
-	orderedTokens := make([]string, 0, len(rows))
+	tokenMap := make(map[string][]rowRef)
+	var orderedTokens []string
 
 	for i, row := range rows {
 		if len(row) < 2 {
-			result[i] = []interface{}{i, "ERROR: missing value"}
+			result[i] = []interface{}{row[0], "ERROR: missing value"}
 			continue
 		}
-		token, ok := row[1].(string)
-		if !ok {
-			token = fmt.Sprintf("%v", row[1])
-		}
+		token := fmt.Sprintf("%v", row[1])
 		refs := tokenMap[token]
 		if len(refs) == 0 {
 			orderedTokens = append(orderedTokens, token)
@@ -365,83 +92,17 @@ func (sc *SkyflowClient) Detokenize(ctx context.Context, rows [][]interface{}) (
 		tokenMap[token] = append(refs, rowRef{origIdx: i, rowIndex: row[0]})
 	}
 
-	metrics.UniqueTokens = len(orderedTokens)
-	if len(rows) > 0 {
-		metrics.DedupPct = 100.0 * (1.0 - float64(len(orderedTokens))/float64(len(rows)))
+	// Call Skyflow API with all unique tokens in a single request
+	values, err := sc.detokenizeBatch(ctx, orderedTokens)
+	if err != nil {
+		return nil, err
 	}
 
-	// Split unique tokens into sub-batches
-	batches := splitStrings(orderedTokens, sc.cfg.BatchSize)
-	metrics.SkyflowCalls = len(batches)
-
+	// Create token → value map
 	valueMap := make(map[string]string, len(orderedTokens))
-	callLatencies := make([]int64, 0, len(batches))
-
-	skyflowStart := time.Now()
-
-	if sc.cfg.MaxConcurrency <= 1 || len(batches) <= 1 {
-		// Sequential path — no goroutine overhead
-		for _, batch := range batches {
-			callStart := time.Now()
-			values, err := sc.detokenizeBatch(ctx, batch)
-			callLatencies = append(callLatencies, time.Since(callStart).Milliseconds())
-			if err != nil {
-				metrics.Errors++
-				errMsg := "ERROR: " + err.Error()
-				for _, tok := range batch {
-					valueMap[tok] = errMsg
-				}
-				continue
-			}
-			for i, tok := range batch {
-				valueMap[tok] = values[i]
-			}
-		}
-	} else {
-		// Concurrent path
-		var mu sync.Mutex
-		var wg sync.WaitGroup
-		useSemaphore := len(batches) > sc.cfg.MaxConcurrency
-		var sem chan struct{}
-		if useSemaphore {
-			sem = make(chan struct{}, sc.cfg.MaxConcurrency)
-		}
-
-		for _, batch := range batches {
-			wg.Add(1)
-			go func(batch []string) {
-				defer wg.Done()
-				if useSemaphore {
-					sem <- struct{}{}
-					defer func() { <-sem }()
-				}
-
-				callStart := time.Now()
-				values, err := sc.detokenizeBatch(ctx, batch)
-				callMs := time.Since(callStart).Milliseconds()
-
-				mu.Lock()
-				callLatencies = append(callLatencies, callMs)
-				if err != nil {
-					metrics.Errors++
-					errMsg := "ERROR: " + err.Error()
-					for _, tok := range batch {
-						valueMap[tok] = errMsg
-					}
-					mu.Unlock()
-					return
-				}
-				for i, tok := range batch {
-					valueMap[tok] = values[i]
-				}
-				mu.Unlock()
-			}(batch)
-		}
-		wg.Wait()
+	for i, token := range orderedTokens {
+		valueMap[token] = values[i]
 	}
-
-	metrics.SkyflowWallMs = time.Since(skyflowStart).Milliseconds()
-	computeLatencyStats(metrics, callLatencies)
 
 	// Fan results back to all original row indexes
 	for token, refs := range tokenMap {
@@ -451,58 +112,16 @@ func (sc *SkyflowClient) Detokenize(ctx context.Context, rows [][]interface{}) (
 		}
 	}
 
-	return result, metrics, nil
+	return result, nil
 }
 
 func (sc *SkyflowClient) detokenizeBatch(ctx context.Context, tokens []string) ([]string, error) {
-	// Use gRPC if available
-	if sc.flowClient != nil {
-		return sc.detokenizeBatchGrpc(ctx, tokens)
-	}
-	return sc.detokenizeBatchREST(ctx, tokens)
-}
-
-func (sc *SkyflowClient) detokenizeBatchGrpc(ctx context.Context, tokens []string) ([]string, error) {
-	grpcCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-	md := metadata.Pairs("X-SKYFLOW-ACCOUNT-ID", sc.cfg.AccountID)
-	grpcCtx = metadata.NewOutgoingContext(grpcCtx, md)
-
-	req := &api.FlowDetokenizeRequest{
-		VaultID: sc.cfg.VaultID,
-		Tokens:  tokens,
-	}
-
-	resp, err := sc.flowClient.Detokenize(grpcCtx, req)
-	if err != nil {
-		return nil, fmt.Errorf("detokenize: grpc error: %w", err)
-	}
-
-	if len(resp.Response) != len(tokens) {
-		return nil, fmt.Errorf("detokenize: expected %d entries, got %d", len(tokens), len(resp.Response))
-	}
-
-	values := make([]string, len(tokens))
-	for i, entry := range resp.Response {
-		if entry.Value != nil {
-			values[i] = entry.Value.GetStringValue()
-		} else if entry.Error != nil {
-			values[i] = "ERROR: " + entry.Error.GetValue()
-		} else {
-			values[i] = "ERROR: no value"
-		}
-	}
-
-	return values, nil
-}
-
-func (sc *SkyflowClient) detokenizeBatchREST(ctx context.Context, tokens []string) ([]string, error) {
 	body := detokenizeRequest{
 		VaultID: sc.cfg.VaultID,
 		Tokens:  tokens,
 	}
 
-	respBody, err := sc.doWithRetry(ctx, sc.cfg.DataPlaneURL+"/v2/tokens/detokenize", body)
+	respBody, err := sc.doPost(ctx, sc.cfg.DataPlaneURL+"/v2/tokens/detokenize", body)
 	if err != nil {
 		return nil, err
 	}
@@ -526,107 +145,35 @@ func (sc *SkyflowClient) detokenizeBatchREST(ctx context.Context, tokens []strin
 
 // --- HTTP helpers ---
 
-func (sc *SkyflowClient) doWithRetry(ctx context.Context, url string, body interface{}) ([]byte, error) {
-	respBody, statusCode, err := sc.doPost(ctx, url, body)
-	if err != nil {
-		return nil, err
-	}
-
-	if statusCode >= 500 || statusCode == 429 {
-		log.Printf("WARN: Skyflow returned %d, retrying after 500ms...", statusCode)
-		time.Sleep(500 * time.Millisecond)
-		respBody, statusCode, err = sc.doPost(ctx, url, body)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	if statusCode < 200 || statusCode >= 300 {
-		return nil, fmt.Errorf("skyflow API returned %d: %s", statusCode, truncate(string(respBody), 200))
-	}
-
-	return respBody, nil
-}
-
-func (sc *SkyflowClient) doPost(ctx context.Context, url string, body interface{}) ([]byte, int, error) {
+func (sc *SkyflowClient) doPost(ctx context.Context, url string, body interface{}) ([]byte, error) {
 	jsonBody, err := json.Marshal(body)
 	if err != nil {
-		return nil, 0, fmt.Errorf("marshal request: %w", err)
+		return nil, fmt.Errorf("marshal request: %w", err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(jsonBody))
 	if err != nil {
-		return nil, 0, fmt.Errorf("create request: %w", err)
+		return nil, fmt.Errorf("create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+sc.cfg.APIKey)
-	if sc.cfg.AccountID != "" {
-		req.Header.Set("X-Skyflow-Account-Id", sc.cfg.AccountID)
-	}
 
 	resp, err := sc.client.Do(req)
 	if err != nil {
-		return nil, 0, fmt.Errorf("skyflow request: %w", err)
+		return nil, fmt.Errorf("skyflow request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, resp.StatusCode, fmt.Errorf("read response: %w", err)
+		return nil, fmt.Errorf("read response: %w", err)
 	}
 
-	return respBody, resp.StatusCode, nil
-}
-
-// --- Utility ---
-
-func computeLatencyStats(m *SkyflowMetrics, latencies []int64) {
-	if len(latencies) == 0 {
-		return
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("skyflow API returned %d: %s", resp.StatusCode, truncate(string(respBody), 200))
 	}
-	var sum int64
-	m.CallMinMs = latencies[0]
-	m.CallMaxMs = latencies[0]
-	for _, l := range latencies {
-		sum += l
-		if l < m.CallMinMs {
-			m.CallMinMs = l
-		}
-		if l > m.CallMaxMs {
-			m.CallMaxMs = l
-		}
-	}
-	m.CallAvgMs = sum / int64(len(latencies))
-}
 
-type indexedValue struct {
-	origIdx  int
-	rowIndex interface{}
-	value    string
-}
-
-func splitIndexedValues(items []indexedValue, size int) [][]indexedValue {
-	var batches [][]indexedValue
-	for i := 0; i < len(items); i += size {
-		end := i + size
-		if end > len(items) {
-			end = len(items)
-		}
-		batches = append(batches, items[i:end])
-	}
-	return batches
-}
-
-func splitStrings(items []string, size int) [][]string {
-	var batches [][]string
-	for i := 0; i < len(items); i += size {
-		end := i + size
-		if end > len(items) {
-			end = len(items)
-		}
-		batches = append(batches, items[i:end])
-	}
-	return batches
+	return respBody, nil
 }
 
 func truncate(s string, maxLen int) string {

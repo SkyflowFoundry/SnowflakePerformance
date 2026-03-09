@@ -4,159 +4,50 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
-	"strings"
-	"sync/atomic"
-	"time"
 
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
 )
 
-var (
-	simulatedDelay  time.Duration
-	invocationCount atomic.Int64
-	skyflowClient   *SkyflowClient
-)
-
-type sfRequest struct {
-	Data [][]interface{} `json:"data"`
-}
-
-type sfResponse struct {
-	Data [][]interface{} `json:"data"`
-}
-
-var lambdaInstanceID string
+var skyflowClient *SkyflowClient
 
 func init() {
-	lambdaInstanceID = fmt.Sprintf("%d", time.Now().UnixNano())
-
-	// Initialize Skyflow client (nil if SKYFLOW_DATA_PLANE_URL not set → mock mode)
 	skyflowCfg := loadSkyflowConfig()
 	if skyflowCfg != nil {
 		skyflowClient = NewSkyflowClient(*skyflowCfg)
-		log.Printf("INFO: Skyflow mode enabled (url=%s, grpc=%s, vault=%s, batch=%d, concurrency=%d)",
-			skyflowCfg.DataPlaneURL, skyflowCfg.GRPCEndpoint, skyflowCfg.VaultID, skyflowCfg.BatchSize, skyflowCfg.MaxConcurrency)
-	} else {
-		log.Printf("INFO: Mock mode (SKYFLOW_DATA_PLANE_URL not set)")
 	}
 }
 
 func handler(ctx context.Context, req events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
-	receiveTs := time.Now().UnixNano()
-	invNum := invocationCount.Add(1)
-
-	// Normalize headers to lowercase (HTTP headers are case-insensitive,
-	// but Go maps are case-sensitive. Snowflake/API Gateway may vary casing.)
-	lowerHeaders := make(map[string]string, len(req.Headers))
-	for k, v := range req.Headers {
-		lowerHeaders[strings.ToLower(k)] = v
-	}
-
-	// Extract Snowflake headers (Snowflake prepends "sf-custom-" to custom headers)
-	queryID := lowerHeaders["sf-external-function-current-query-id"]
-	batchID := lowerHeaders["sf-external-function-query-batch-id"]
-	benchConfig := lowerHeaders["sf-benchmark-config"]
-	operation := lowerHeaders["sf-custom-x-operation"]
-	if operation == "" {
-		operation = "detokenize" // backward compatible
-	}
-	operation = strings.ToLower(operation)
-
-	if queryID == "" {
-		queryID = "unknown"
-	}
-	if batchID == "" {
-		batchID = "unknown"
-	}
-	if benchConfig == "" {
-		benchConfig = "unknown"
-	}
-
-	// Parse request
-	var sfReq sfRequest
-	if err := json.Unmarshal([]byte(req.Body), &sfReq); err != nil {
-		log.Printf("ERROR: failed to parse request body: %v", err)
+	var requestData [][]interface{}
+	if err := json.Unmarshal([]byte(req.Body), &map[string]interface{}{"data": &requestData}); err != nil {
 		return events.APIGatewayProxyResponse{
 			StatusCode: 400,
-			Body:       fmt.Sprintf(`{"error": "invalid request body: %v"}`, err),
+			Body:       fmt.Sprintf(`{"error": "invalid request: %v"}`, err),
 		}, nil
 	}
 
-	batchSize := len(sfReq.Data)
-
-	// Determine mode and build response
-	mode := "mock"
-	var resp sfResponse
-	var skyflowM *SkyflowMetrics
-	if skyflowClient != nil {
-		mode = "skyflow"
-		var respData [][]interface{}
-		var skyflowErr error
-		switch operation {
-		case "tokenize":
-			respData, skyflowM, skyflowErr = skyflowClient.Tokenize(ctx, sfReq.Data)
-		case "detokenize":
-			respData, skyflowM, skyflowErr = skyflowClient.Detokenize(ctx, sfReq.Data)
-		default:
-			return events.APIGatewayProxyResponse{
-				StatusCode: 400,
-				Body:       fmt.Sprintf(`{"error": "unknown operation: %s"}`, operation),
-			}, nil
-		}
-		if skyflowErr != nil {
-			log.Printf("ERROR: Skyflow %s failed: %v", operation, skyflowErr)
-			return events.APIGatewayProxyResponse{
-				StatusCode: 500,
-				Body:       fmt.Sprintf(`{"error": "skyflow %s failed: %v"}`, operation, skyflowErr),
-			}, nil
-		}
-		resp = sfResponse{Data: respData}
-	} else {
-		// Mock mode: simulated delay + DETOK_ prefix
-		if simulatedDelay > 0 {
-			time.Sleep(simulatedDelay)
-		}
-		seen := make(map[string]struct{}, batchSize)
-		resp = sfResponse{Data: make([][]interface{}, batchSize)}
-		for i, row := range sfReq.Data {
-			if len(row) < 2 {
-				resp.Data[i] = []interface{}{i, "DETOK_ERROR_MISSING_VALUE"}
-				continue
-			}
-			rowNum := row[0]
-			tokenVal := fmt.Sprintf("%v", row[1])
-			seen[tokenVal] = struct{}{}
-			resp.Data[i] = []interface{}{rowNum, "DETOK_" + tokenVal}
-		}
-		uniqueTokens := len(seen)
-		dedupPct := 0.0
-		if batchSize > 0 {
-			dedupPct = (1 - float64(uniqueTokens)/float64(batchSize)) * 100
-		}
-		skyflowM = &SkyflowMetrics{
-			UniqueTokens: uniqueTokens,
-			DedupPct:     dedupPct,
-		}
+	if skyflowClient == nil {
+		return events.APIGatewayProxyResponse{
+			StatusCode: 500,
+			Body:       `{"error": "skyflow client not configured"}`,
+		}, nil
 	}
 
-	processingDur := time.Now().UnixNano() - receiveTs
-
-	// Log to CloudWatch (skyflowM is always set — both Skyflow and mock modes populate it)
-	lambdaOverheadMs := processingDur/1e6 - skyflowM.SkyflowWallMs
-	log.Printf("METRIC query_id=%s batch_id=%s batch_size=%d operation=%s mode=%s duration_ms=%d "+
-		"unique_tokens=%d dedup_pct=%.1f skyflow_calls=%d skyflow_wall_ms=%d "+
-		"call_min_ms=%d call_avg_ms=%d call_max_ms=%d lambda_overhead_ms=%d errors=%d "+
-		"invocation=%d instance=%s config=%s",
-		queryID, batchID, batchSize, operation, mode, processingDur/1e6,
-		skyflowM.UniqueTokens, skyflowM.DedupPct, skyflowM.SkyflowCalls, skyflowM.SkyflowWallMs,
-		skyflowM.CallMinMs, skyflowM.CallAvgMs, skyflowM.CallMaxMs, lambdaOverheadMs, skyflowM.Errors,
-		invNum, lambdaInstanceID, benchConfig)
-
-	respBody, err := json.Marshal(resp)
+	result, err := skyflowClient.Detokenize(ctx, requestData)
 	if err != nil {
-		return events.APIGatewayProxyResponse{StatusCode: 500, Body: `{"error":"marshal failure"}`}, nil
+		return events.APIGatewayProxyResponse{
+			StatusCode: 500,
+			Body:       fmt.Sprintf(`{"error": "detokenize failed: %v"}`, err),
+		}, nil
+	}
+
+	respBody, err := json.Marshal(map[string]interface{}{"data": result})
+	if err != nil {
+		return events.APIGatewayProxyResponse{
+			StatusCode: 500,
+			Body:       `{"error": "response encoding failed"}`,
+		}, nil
 	}
 
 	return events.APIGatewayProxyResponse{
