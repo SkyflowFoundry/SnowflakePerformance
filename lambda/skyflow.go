@@ -36,15 +36,15 @@ type SkyflowConfig struct {
 
 // SkyflowMetrics captures per-invocation metrics across all three layers.
 type SkyflowMetrics struct {
-	TotalRows    int   // rows received from Snowflake
-	UniqueTokens int   // unique tokens after dedup (= TotalRows for tokenize)
-	DedupPct     float64 // percent reduction from dedup
-	SkyflowCalls int   // number of Skyflow API sub-batch calls
-	SkyflowWallMs int64 // wall clock ms for all Skyflow work (concurrent)
-	CallMinMs    int64  // fastest individual API call
-	CallMaxMs    int64  // slowest individual API call
-	CallAvgMs    int64  // average individual API call
-	Errors       int   // API errors/retries
+	TotalRows     int     // rows received from Snowflake
+	UniqueTokens  int     // unique tokens after dedup (= TotalRows for tokenize)
+	DedupPct      float64 // percent reduction from dedup
+	SkyflowCalls  int     // number of Skyflow API sub-batch calls
+	SkyflowWallMs int64   // wall clock ms for all Skyflow work (concurrent)
+	CallMinMs     int64   // fastest individual API call
+	CallMaxMs     int64   // slowest individual API call
+	CallAvgMs     int64   // average individual API call
+	Errors        int     // API errors/retries
 }
 
 // SkyflowClient makes batched, concurrent calls to the Skyflow v2 API.
@@ -337,9 +337,8 @@ type detokenizeEntry struct {
 }
 
 // Detokenize sends tokens to Skyflow for detokenization with deduplication.
-func (sc *SkyflowClient) Detokenize(ctx context.Context, rows [][]interface{}) ([][]interface{}, *SkyflowMetrics, error) {
+func (sc *SkyflowClient) Detokenize(ctx context.Context, rows [][]interface{}) ([][]interface{}, error) {
 	result := make([][]interface{}, len(rows))
-	metrics := &SkyflowMetrics{TotalRows: len(rows)}
 
 	// Build dedup map: token → list of (origIdx, rowIndex)
 	type rowRef struct {
@@ -347,11 +346,11 @@ func (sc *SkyflowClient) Detokenize(ctx context.Context, rows [][]interface{}) (
 		rowIndex interface{}
 	}
 	tokenMap := make(map[string][]rowRef, len(rows))
-	orderedTokens := make([]string, 0, len(rows))
+	var orderedTokens []string
 
 	for i, row := range rows {
 		if len(row) < 2 {
-			result[i] = []interface{}{i, "ERROR: missing value"}
+			result[i] = []interface{}{row[0], "ERROR: missing value"}
 			continue
 		}
 		token, ok := row[1].(string)
@@ -365,83 +364,17 @@ func (sc *SkyflowClient) Detokenize(ctx context.Context, rows [][]interface{}) (
 		tokenMap[token] = append(refs, rowRef{origIdx: i, rowIndex: row[0]})
 	}
 
-	metrics.UniqueTokens = len(orderedTokens)
-	if len(rows) > 0 {
-		metrics.DedupPct = 100.0 * (1.0 - float64(len(orderedTokens))/float64(len(rows)))
+	// Call Skyflow API with all unique tokens in a single request
+	values, err := sc.detokenizeBatch(ctx, orderedTokens)
+	if err != nil {
+		return nil, err
 	}
 
-	// Split unique tokens into sub-batches
-	batches := splitStrings(orderedTokens, sc.cfg.BatchSize)
-	metrics.SkyflowCalls = len(batches)
-
+	// Create token → value map
 	valueMap := make(map[string]string, len(orderedTokens))
-	callLatencies := make([]int64, 0, len(batches))
-
-	skyflowStart := time.Now()
-
-	if sc.cfg.MaxConcurrency <= 1 || len(batches) <= 1 {
-		// Sequential path — no goroutine overhead
-		for _, batch := range batches {
-			callStart := time.Now()
-			values, err := sc.detokenizeBatch(ctx, batch)
-			callLatencies = append(callLatencies, time.Since(callStart).Milliseconds())
-			if err != nil {
-				metrics.Errors++
-				errMsg := "ERROR: " + err.Error()
-				for _, tok := range batch {
-					valueMap[tok] = errMsg
-				}
-				continue
-			}
-			for i, tok := range batch {
-				valueMap[tok] = values[i]
-			}
-		}
-	} else {
-		// Concurrent path
-		var mu sync.Mutex
-		var wg sync.WaitGroup
-		useSemaphore := len(batches) > sc.cfg.MaxConcurrency
-		var sem chan struct{}
-		if useSemaphore {
-			sem = make(chan struct{}, sc.cfg.MaxConcurrency)
-		}
-
-		for _, batch := range batches {
-			wg.Add(1)
-			go func(batch []string) {
-				defer wg.Done()
-				if useSemaphore {
-					sem <- struct{}{}
-					defer func() { <-sem }()
-				}
-
-				callStart := time.Now()
-				values, err := sc.detokenizeBatch(ctx, batch)
-				callMs := time.Since(callStart).Milliseconds()
-
-				mu.Lock()
-				callLatencies = append(callLatencies, callMs)
-				if err != nil {
-					metrics.Errors++
-					errMsg := "ERROR: " + err.Error()
-					for _, tok := range batch {
-						valueMap[tok] = errMsg
-					}
-					mu.Unlock()
-					return
-				}
-				for i, tok := range batch {
-					valueMap[tok] = values[i]
-				}
-				mu.Unlock()
-			}(batch)
-		}
-		wg.Wait()
+	for i, token := range orderedTokens {
+		valueMap[token] = values[i]
 	}
-
-	metrics.SkyflowWallMs = time.Since(skyflowStart).Milliseconds()
-	computeLatencyStats(metrics, callLatencies)
 
 	// Fan results back to all original row indexes
 	for token, refs := range tokenMap {
@@ -451,7 +384,7 @@ func (sc *SkyflowClient) Detokenize(ctx context.Context, rows [][]interface{}) (
 		}
 	}
 
-	return result, metrics, nil
+	return result, nil
 }
 
 func (sc *SkyflowClient) detokenizeBatch(ctx context.Context, tokens []string) ([]string, error) {
