@@ -13,9 +13,11 @@ import (
 	"sync"
 	"time"
 
+	"crypto/tls"
+
 	api "github.com/skyflowapi/common/api/v2"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/metadata"
 )
 
@@ -131,7 +133,7 @@ func NewSkyflowClient(cfg SkyflowConfig) *SkyflowClient {
 	if cfg.GRPCEndpoint != "" {
 		conn, err := grpc.NewClient(
 			cfg.GRPCEndpoint,
-			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{})),
 			grpc.WithPerRPCCredentials(basicAuthCreds{token: cfg.APIKey}),
 			grpc.WithDefaultCallOptions(
 				grpc.MaxCallRecvMsgSize(64*1024*1024),
