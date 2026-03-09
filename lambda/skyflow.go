@@ -131,6 +131,9 @@ func NewSkyflowClient(cfg SkyflowConfig) *SkyflowClient {
 
 	// Initialize gRPC client if endpoint is configured
 	if cfg.GRPCEndpoint != "" {
+		// NLB terminates TLS without ALPN h2 negotiation.
+		// grpc-go >= 1.67 enforces ALPN by default — requires GRPC_ENFORCE_ALPN_ENABLED=false
+		// in Lambda environment variables (must be set before grpc package init).
 		conn, err := grpc.NewClient(
 			cfg.GRPCEndpoint,
 			grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{})),
