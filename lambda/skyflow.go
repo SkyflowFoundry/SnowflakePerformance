@@ -23,15 +23,18 @@ import (
 
 // SkyflowConfig holds environment-driven configuration for the Skyflow v2 API.
 type SkyflowConfig struct {
-	DataPlaneURL   string
-	GRPCEndpoint   string
-	AccountID      string
-	APIKey         string
-	VaultID        string
-	TableName      string
-	ColumnName     string
-	BatchSize      int
-	MaxConcurrency int
+	DataPlaneURL     string
+	GRPCEndpoint     string
+	AccountID        string
+	APIKey           string
+	VaultID          string
+	TableName        string
+	ColumnName       string
+	BatchSize        int
+	MaxConcurrency   int
+	GRPCTimeoutMs    int // per-call timeout in ms (default 100)
+	GRPCRetries      int // max retries on timeout (default 2)
+	GRPCHardDeadline int // absolute deadline in ms (default 2000)
 }
 
 // SkyflowMetrics captures per-invocation metrics across all three layers.
@@ -70,8 +73,11 @@ func loadSkyflowConfig() *SkyflowConfig {
 		VaultID:        os.Getenv("SKYFLOW_VAULT_ID"),
 		TableName:      envOrDefault("SKYFLOW_TABLE_NAME", "table1"),
 		ColumnName:     envOrDefault("SKYFLOW_COLUMN_NAME", "name"),
-		BatchSize:      envIntOrDefault("SKYFLOW_BATCH_SIZE", 25),
-		MaxConcurrency: envIntOrDefault("SKYFLOW_MAX_CONCURRENCY", 10),
+		BatchSize:        envIntOrDefault("SKYFLOW_BATCH_SIZE", 25),
+		MaxConcurrency:   envIntOrDefault("SKYFLOW_MAX_CONCURRENCY", 10),
+		GRPCTimeoutMs:    envIntOrDefault("SKYFLOW_GRPC_TIMEOUT_MS", 100),
+		GRPCRetries:      envIntOrDefault("SKYFLOW_GRPC_RETRIES", 2),
+		GRPCHardDeadline: envIntOrDefault("SKYFLOW_GRPC_HARD_DEADLINE_MS", 2000),
 	}
 
 	if cfg.APIKey == "" {
@@ -463,37 +469,54 @@ func (sc *SkyflowClient) detokenizeBatch(ctx context.Context, tokens []string) (
 }
 
 func (sc *SkyflowClient) detokenizeBatchGrpc(ctx context.Context, tokens []string) ([]string, error) {
-	grpcCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
+	hardCtx, hardCancel := context.WithTimeout(ctx, time.Duration(sc.cfg.GRPCHardDeadline)*time.Millisecond)
+	defer hardCancel()
+
 	md := metadata.Pairs("X-SKYFLOW-ACCOUNT-ID", sc.cfg.AccountID)
-	grpcCtx = metadata.NewOutgoingContext(grpcCtx, md)
 
 	req := &api.FlowDetokenizeRequest{
 		VaultID: sc.cfg.VaultID,
 		Tokens:  tokens,
 	}
 
-	resp, err := sc.flowClient.Detokenize(grpcCtx, req)
-	if err != nil {
-		return nil, fmt.Errorf("detokenize: grpc error: %w", err)
-	}
+	var lastErr error
+	for attempt := 0; attempt <= sc.cfg.GRPCRetries; attempt++ {
+		callCtx, callCancel := context.WithTimeout(hardCtx, time.Duration(sc.cfg.GRPCTimeoutMs)*time.Millisecond)
+		grpcCtx := metadata.NewOutgoingContext(callCtx, md)
 
-	if len(resp.Response) != len(tokens) {
-		return nil, fmt.Errorf("detokenize: expected %d entries, got %d", len(tokens), len(resp.Response))
-	}
+		resp, err := sc.flowClient.Detokenize(grpcCtx, req)
+		callCancel()
 
-	values := make([]string, len(tokens))
-	for i, entry := range resp.Response {
-		if entry.Value != nil {
-			values[i] = entry.Value.GetStringValue()
-		} else if entry.Error != nil {
-			values[i] = "ERROR: " + entry.Error.GetValue()
-		} else {
-			values[i] = "ERROR: no value"
+		if err != nil {
+			lastErr = err
+			// Only retry on deadline exceeded (slow call), not on other errors
+			if hardCtx.Err() != nil {
+				break // hard deadline hit, stop retrying
+			}
+			if ctx.Err() != nil {
+				break // parent context cancelled
+			}
+			continue // timeout — retry immediately on likely different pod
 		}
+
+		if len(resp.Response) != len(tokens) {
+			return nil, fmt.Errorf("detokenize: expected %d entries, got %d", len(tokens), len(resp.Response))
+		}
+
+		values := make([]string, len(tokens))
+		for i, entry := range resp.Response {
+			if entry.Value != nil {
+				values[i] = entry.Value.GetStringValue()
+			} else if entry.Error != nil {
+				values[i] = "ERROR: " + entry.Error.GetValue()
+			} else {
+				values[i] = "ERROR: no value"
+			}
+		}
+		return values, nil
 	}
 
-	return values, nil
+	return nil, fmt.Errorf("detokenize: grpc error after %d attempts: %w", sc.cfg.GRPCRetries+1, lastErr)
 }
 
 func (sc *SkyflowClient) detokenizeBatchREST(ctx context.Context, tokens []string) ([]string, error) {
