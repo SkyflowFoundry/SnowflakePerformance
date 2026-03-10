@@ -32,22 +32,24 @@ type SkyflowConfig struct {
 	ColumnName       string
 	BatchSize        int
 	MaxConcurrency   int
-	GRPCTimeoutMs    int // per-call timeout in ms (default 100)
-	GRPCRetries      int // max retries on timeout (default 2)
-	GRPCHardDeadline int // absolute deadline in ms (default 2000)
+	GRPCTimeoutMs    int  // per-call timeout in ms (default 100)
+	GRPCRetries      int  // max retries on timeout (default 2)
+	GRPCHardDeadline int  // absolute deadline in ms (default 2000)
+	UniformBatches   bool // distribute tokens uniformly across batches (default true)
 }
 
 // SkyflowMetrics captures per-invocation metrics across all three layers.
 type SkyflowMetrics struct {
-	TotalRows    int   // rows received from Snowflake
-	UniqueTokens int   // unique tokens after dedup (= TotalRows for tokenize)
-	DedupPct     float64 // percent reduction from dedup
-	SkyflowCalls int   // number of Skyflow API sub-batch calls
-	SkyflowWallMs int64 // wall clock ms for all Skyflow work (concurrent)
-	CallMinMs    int64  // fastest individual API call
-	CallMaxMs    int64  // slowest individual API call
-	CallAvgMs    int64  // average individual API call
-	Errors       int   // API errors/retries
+	TotalRows     int     // rows received from Snowflake
+	UniqueTokens  int     // unique tokens after dedup (= TotalRows for tokenize)
+	DedupPct      float64 // percent reduction from dedup
+	SkyflowCalls  int     // number of Skyflow API sub-batch calls
+	SkyflowWallMs int64   // wall clock ms for all Skyflow work (concurrent)
+	CallMinMs     int64   // fastest individual API call
+	CallMaxMs     int64   // slowest individual API call
+	CallAvgMs     int64   // average individual API call
+	Errors        int     // API errors (final failures)
+	Retries       int     // total gRPC retries across all sub-batches
 }
 
 // SkyflowClient makes batched, concurrent calls to the Skyflow v2 API.
@@ -78,6 +80,7 @@ func loadSkyflowConfig() *SkyflowConfig {
 		GRPCTimeoutMs:    envIntOrDefault("SKYFLOW_GRPC_TIMEOUT_MS", 100),
 		GRPCRetries:      envIntOrDefault("SKYFLOW_GRPC_RETRIES", 2),
 		GRPCHardDeadline: envIntOrDefault("SKYFLOW_GRPC_HARD_DEADLINE_MS", 2000),
+		UniformBatches:   envBoolOrDefault("SKYFLOW_UNIFORM_BATCHES", true),
 	}
 
 	if cfg.APIKey == "" {
@@ -101,6 +104,16 @@ func envIntOrDefault(key string, fallback int) int {
 	if v := os.Getenv(key); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			return n
+		}
+	}
+	return fallback
+}
+
+func envBoolOrDefault(key string, fallback bool) bool {
+	if v := os.Getenv(key); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err == nil {
+			return b
 		}
 	}
 	return fallback
@@ -374,7 +387,15 @@ func (sc *SkyflowClient) Detokenize(ctx context.Context, rows []SfRow) ([]SfRow,
 	}
 
 	// Split unique tokens into sub-batches
-	batches := splitStrings(orderedTokens, sc.cfg.BatchSize)
+	var batches [][]string
+	if sc.cfg.UniformBatches {
+		// Uniform distribution: calculate number of batches, then divide equally
+		// so all batches finish at roughly the same time when dispatched concurrently.
+		numBatches := (len(orderedTokens) + sc.cfg.BatchSize - 1) / sc.cfg.BatchSize
+		batches = splitStringsUniform(orderedTokens, numBatches)
+	} else {
+		batches = splitStrings(orderedTokens, sc.cfg.BatchSize)
+	}
 	metrics.SkyflowCalls = len(batches)
 
 	valueMap := make(map[string]string, len(orderedTokens))
@@ -386,8 +407,9 @@ func (sc *SkyflowClient) Detokenize(ctx context.Context, rows []SfRow) ([]SfRow,
 		// Sequential path — no goroutine overhead
 		for _, batch := range batches {
 			callStart := time.Now()
-			values, err := sc.detokenizeBatch(ctx, batch)
+			values, retries, err := sc.detokenizeBatch(ctx, batch)
 			callLatencies = append(callLatencies, time.Since(callStart).Milliseconds())
+			metrics.Retries += retries
 			if err != nil {
 				metrics.Errors++
 				errMsg := "ERROR: " + err.Error()
@@ -420,11 +442,12 @@ func (sc *SkyflowClient) Detokenize(ctx context.Context, rows []SfRow) ([]SfRow,
 				}
 
 				callStart := time.Now()
-				values, err := sc.detokenizeBatch(ctx, batch)
+				values, retries, err := sc.detokenizeBatch(ctx, batch)
 				callMs := time.Since(callStart).Milliseconds()
 
 				mu.Lock()
 				callLatencies = append(callLatencies, callMs)
+				metrics.Retries += retries
 				if err != nil {
 					metrics.Errors++
 					errMsg := "ERROR: " + err.Error()
@@ -457,15 +480,18 @@ func (sc *SkyflowClient) Detokenize(ctx context.Context, rows []SfRow) ([]SfRow,
 	return result, metrics, nil
 }
 
-func (sc *SkyflowClient) detokenizeBatch(ctx context.Context, tokens []string) ([]string, error) {
+// detokenizeBatch returns (values, retries, error).
+func (sc *SkyflowClient) detokenizeBatch(ctx context.Context, tokens []string) ([]string, int, error) {
 	// Use gRPC if available
 	if sc.flowClient != nil {
 		return sc.detokenizeBatchGrpc(ctx, tokens)
 	}
-	return sc.detokenizeBatchREST(ctx, tokens)
+	vals, err := sc.detokenizeBatchREST(ctx, tokens)
+	return vals, 0, err
 }
 
-func (sc *SkyflowClient) detokenizeBatchGrpc(ctx context.Context, tokens []string) ([]string, error) {
+// detokenizeBatchGrpc returns (values, retries, error).
+func (sc *SkyflowClient) detokenizeBatchGrpc(ctx context.Context, tokens []string) ([]string, int, error) {
 	hardCtx, hardCancel := context.WithTimeout(ctx, time.Duration(sc.cfg.GRPCHardDeadline)*time.Millisecond)
 	defer hardCancel()
 
@@ -477,6 +503,7 @@ func (sc *SkyflowClient) detokenizeBatchGrpc(ctx context.Context, tokens []strin
 	}
 
 	var lastErr error
+	retries := 0
 	for attempt := 0; attempt <= sc.cfg.GRPCRetries; attempt++ {
 		callCtx, callCancel := context.WithTimeout(hardCtx, time.Duration(sc.cfg.GRPCTimeoutMs)*time.Millisecond)
 		grpcCtx := metadata.NewOutgoingContext(callCtx, md)
@@ -486,6 +513,7 @@ func (sc *SkyflowClient) detokenizeBatchGrpc(ctx context.Context, tokens []strin
 
 		if err != nil {
 			lastErr = err
+			retries++
 			// Only retry on deadline exceeded (slow call), not on other errors
 			if hardCtx.Err() != nil {
 				break // hard deadline hit, stop retrying
@@ -497,7 +525,7 @@ func (sc *SkyflowClient) detokenizeBatchGrpc(ctx context.Context, tokens []strin
 		}
 
 		if len(resp.Response) != len(tokens) {
-			return nil, fmt.Errorf("detokenize: expected %d entries, got %d", len(tokens), len(resp.Response))
+			return nil, retries, fmt.Errorf("detokenize: expected %d entries, got %d", len(tokens), len(resp.Response))
 		}
 
 		values := make([]string, len(tokens))
@@ -510,10 +538,10 @@ func (sc *SkyflowClient) detokenizeBatchGrpc(ctx context.Context, tokens []strin
 				values[i] = "ERROR: no value"
 			}
 		}
-		return values, nil
+		return values, retries, nil
 	}
 
-	return nil, fmt.Errorf("detokenize: grpc error after %d attempts: %w", sc.cfg.GRPCRetries+1, lastErr)
+	return nil, retries, fmt.Errorf("detokenize: grpc error after %d attempts: %w", sc.cfg.GRPCRetries+1, lastErr)
 }
 
 func (sc *SkyflowClient) detokenizeBatchREST(ctx context.Context, tokens []string) ([]string, error) {
@@ -645,6 +673,30 @@ func splitStrings(items []string, size int) [][]string {
 			end = len(items)
 		}
 		batches = append(batches, items[i:end])
+	}
+	return batches
+}
+
+// splitStringsUniform divides items into n batches of roughly equal size.
+// E.g. 1810 items into 4 batches → [453, 453, 452, 452]
+func splitStringsUniform(items []string, n int) [][]string {
+	if n <= 0 || len(items) == 0 {
+		return nil
+	}
+	if n > len(items) {
+		n = len(items)
+	}
+	batches := make([][]string, n)
+	base := len(items) / n
+	extra := len(items) % n
+	offset := 0
+	for i := 0; i < n; i++ {
+		size := base
+		if i < extra {
+			size++
+		}
+		batches[i] = items[offset : offset+size]
+		offset += size
 	}
 	return batches
 }

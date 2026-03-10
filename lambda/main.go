@@ -14,9 +14,10 @@ import (
 )
 
 var (
-	simulatedDelay  time.Duration
-	invocationCount atomic.Int64
-	skyflowClient   *SkyflowClient
+	simulatedDelay    time.Duration
+	invocationCount   atomic.Int64
+	skyflowClient     *SkyflowClient
+	metricLogMinMs    int64 // only log METRIC lines when duration_ms >= this (0 = log all)
 )
 
 // SfRow is a strongly-typed Snowflake external function row [rowNum, value].
@@ -82,6 +83,7 @@ var lambdaInstanceID string
 
 func init() {
 	lambdaInstanceID = fmt.Sprintf("%d", time.Now().UnixNano())
+	metricLogMinMs = int64(envIntOrDefault("METRIC_LOG_MIN_MS", 0))
 
 	// Initialize Skyflow client (nil if SKYFLOW_DATA_PLANE_URL not set → mock mode)
 	skyflowCfg := loadSkyflowConfig()
@@ -184,15 +186,18 @@ func handler(ctx context.Context, req events.APIGatewayProxyRequest) (events.API
 	processingDur := time.Now().UnixNano() - receiveTs
 
 	// Log to CloudWatch (skyflowM is always set — both Skyflow and mock modes populate it)
-	lambdaOverheadMs := processingDur/1e6 - skyflowM.SkyflowWallMs
-	log.Printf("METRIC query_id=%s batch_id=%s batch_size=%d operation=%s mode=%s duration_ms=%d "+
-		"unique_tokens=%d dedup_pct=%.1f skyflow_calls=%d skyflow_wall_ms=%d "+
-		"call_min_ms=%d call_avg_ms=%d call_max_ms=%d lambda_overhead_ms=%d errors=%d "+
-		"invocation=%d instance=%s config=%s",
-		queryID, batchID, batchSize, operation, mode, processingDur/1e6,
-		skyflowM.UniqueTokens, skyflowM.DedupPct, skyflowM.SkyflowCalls, skyflowM.SkyflowWallMs,
-		skyflowM.CallMinMs, skyflowM.CallAvgMs, skyflowM.CallMaxMs, lambdaOverheadMs, skyflowM.Errors,
-		invNum, lambdaInstanceID, benchConfig)
+	durationMs := processingDur / 1e6
+	lambdaOverheadMs := durationMs - skyflowM.SkyflowWallMs
+	if durationMs >= metricLogMinMs {
+		log.Printf("METRIC query_id=%s batch_id=%s batch_size=%d operation=%s mode=%s duration_ms=%d "+
+			"unique_tokens=%d dedup_pct=%.1f skyflow_calls=%d skyflow_wall_ms=%d "+
+			"call_min_ms=%d call_avg_ms=%d call_max_ms=%d lambda_overhead_ms=%d errors=%d retries=%d "+
+			"invocation=%d instance=%s config=%s",
+			queryID, batchID, batchSize, operation, mode, durationMs,
+			skyflowM.UniqueTokens, skyflowM.DedupPct, skyflowM.SkyflowCalls, skyflowM.SkyflowWallMs,
+			skyflowM.CallMinMs, skyflowM.CallAvgMs, skyflowM.CallMaxMs, lambdaOverheadMs, skyflowM.Errors, skyflowM.Retries,
+			invNum, lambdaInstanceID, benchConfig)
+	}
 
 	respBody, err := json.Marshal(resp)
 	if err != nil {

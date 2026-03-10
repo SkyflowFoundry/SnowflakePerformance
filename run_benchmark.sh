@@ -1659,8 +1659,8 @@ LIMIT 1;
   if [[ "$STATUS" != "complete" ]]; then
     STATUS_SUFFIX=" [${STATUS}]"
   fi
-  printf "%-8s | %-18s | %4d/%-4d | %6dms | %6dms | %10d | %s%s\n" \
-    "$wh" "$tbl" "$iter" "$ITERATIONS" "$WALLCLOCK_MS" "$SF_ELAPSED" "$SF_ROWS_PER_SEC" "$run_phase" "$STATUS_SUFFIX"
+  printf "%-8s | %-18s | %4d/%-4d | %6dms | %6dms | %10d | %-8s | %s%s\n" \
+    "$wh" "$tbl" "$iter" "$ITERATIONS" "$WALLCLOCK_MS" "$SF_ELAPSED" "$SF_ROWS_PER_SEC" "$run_phase" "$QUERY_ID" "$STATUS_SUFFIX"
 }
 
 # Build test matrix
@@ -1704,10 +1704,10 @@ if $PROBE; then
     fi
   done
 else
-  printf "%-8s | %-18s | %-9s | %8s | %8s | %10s | %s\n" \
-    "WH" "TABLE" "ITER" "WALL_MS" "SF_MS" "SF_RPS" "PHASE"
+  printf "%-8s | %-18s | %-9s | %8s | %8s | %10s | %-8s | %s\n" \
+    "WH" "TABLE" "ITER" "WALL_MS" "SF_MS" "SF_RPS" "PHASE" "QUERY_ID"
   printf "%s\n" \
-    "---------|--------------------|-----------|---------|---------|------------|----------"
+    "---------|--------------------|-----------|---------|---------|------------|----------|--------------------------------------"
 
   for entry in "${MATRIX[@]}"; do
     IFS='|' read -r wh tbl <<< "$entry"
