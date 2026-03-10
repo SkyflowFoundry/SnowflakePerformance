@@ -19,12 +19,63 @@ var (
 	skyflowClient   *SkyflowClient
 )
 
+// SfRow is a strongly-typed Snowflake external function row [rowNum, value].
+// Custom JSON avoids [][]interface{} allocations and type assertions.
+type SfRow struct {
+	RowNum json.RawMessage // preserve original row number exactly as Snowflake sent it
+	Value  string
+}
+
+func (r *SfRow) UnmarshalJSON(data []byte) error {
+	// Expect JSON array: [rowNum, "value"]
+	if len(data) < 2 || data[0] != '[' {
+		return fmt.Errorf("expected JSON array, got %c", data[0])
+	}
+	depth := 0
+	commaIdx := -1
+	for i := 1; i < len(data)-1; i++ {
+		switch data[i] {
+		case '[', '{':
+			depth++
+		case ']', '}':
+			depth--
+		case ',':
+			if depth == 0 {
+				commaIdx = i
+				break
+			}
+		}
+		if commaIdx >= 0 {
+			break
+		}
+	}
+	if commaIdx < 0 {
+		return fmt.Errorf("expected [rowNum, value], no comma found")
+	}
+	r.RowNum = json.RawMessage(data[1:commaIdx])
+	return json.Unmarshal(data[commaIdx+1:len(data)-1], &r.Value)
+}
+
+func (r SfRow) MarshalJSON() ([]byte, error) {
+	valBytes, err := json.Marshal(r.Value)
+	if err != nil {
+		return nil, err
+	}
+	buf := make([]byte, 0, 1+len(r.RowNum)+1+len(valBytes)+1)
+	buf = append(buf, '[')
+	buf = append(buf, r.RowNum...)
+	buf = append(buf, ',')
+	buf = append(buf, valBytes...)
+	buf = append(buf, ']')
+	return buf, nil
+}
+
 type sfRequest struct {
-	Data [][]interface{} `json:"data"`
+	Data []SfRow `json:"data"`
 }
 
 type sfResponse struct {
-	Data [][]interface{} `json:"data"`
+	Data []SfRow `json:"data"`
 }
 
 var lambdaInstanceID string
@@ -92,43 +143,32 @@ func handler(ctx context.Context, req events.APIGatewayProxyRequest) (events.API
 	var skyflowM *SkyflowMetrics
 	if skyflowClient != nil {
 		mode = "skyflow"
-		var respData [][]interface{}
 		var skyflowErr error
 		switch operation {
-		case "tokenize":
-			respData, skyflowM, skyflowErr = skyflowClient.Tokenize(ctx, sfReq.Data)
 		case "detokenize":
+			var respData []SfRow
 			respData, skyflowM, skyflowErr = skyflowClient.Detokenize(ctx, sfReq.Data)
+			if skyflowErr != nil {
+				log.Printf("ERROR: Skyflow %s failed: %v", operation, skyflowErr)
+				return events.APIGatewayProxyResponse{
+					StatusCode: 500,
+					Body:       fmt.Sprintf(`{"error": "skyflow %s failed: %v"}`, operation, skyflowErr),
+				}, nil
+			}
+			resp = sfResponse{Data: respData}
 		default:
 			return events.APIGatewayProxyResponse{
 				StatusCode: 400,
 				Body:       fmt.Sprintf(`{"error": "unknown operation: %s"}`, operation),
 			}, nil
 		}
-		if skyflowErr != nil {
-			log.Printf("ERROR: Skyflow %s failed: %v", operation, skyflowErr)
-			return events.APIGatewayProxyResponse{
-				StatusCode: 500,
-				Body:       fmt.Sprintf(`{"error": "skyflow %s failed: %v"}`, operation, skyflowErr),
-			}, nil
-		}
-		resp = sfResponse{Data: respData}
 	} else {
-		// Mock mode: simulated delay + DETOK_ prefix
-		if simulatedDelay > 0 {
-			time.Sleep(simulatedDelay)
-		}
+		// Mock mode: echo rows back with DETOK_ prefix
 		seen := make(map[string]struct{}, batchSize)
-		resp = sfResponse{Data: make([][]interface{}, batchSize)}
+		resp = sfResponse{Data: make([]SfRow, batchSize)}
 		for i, row := range sfReq.Data {
-			if len(row) < 2 {
-				resp.Data[i] = []interface{}{i, "DETOK_ERROR_MISSING_VALUE"}
-				continue
-			}
-			rowNum := row[0]
-			tokenVal := fmt.Sprintf("%v", row[1])
-			seen[tokenVal] = struct{}{}
-			resp.Data[i] = []interface{}{rowNum, "DETOK_" + tokenVal}
+			seen[row.Value] = struct{}{}
+			resp.Data[i] = SfRow{RowNum: row.RowNum, Value: "DETOK_" + row.Value}
 		}
 		uniqueTokens := len(seen)
 		dedupPct := 0.0

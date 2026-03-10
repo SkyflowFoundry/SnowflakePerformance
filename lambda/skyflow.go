@@ -343,32 +343,29 @@ type detokenizeEntry struct {
 }
 
 // Detokenize sends tokens to Skyflow for detokenization with deduplication.
-func (sc *SkyflowClient) Detokenize(ctx context.Context, rows [][]interface{}) ([][]interface{}, *SkyflowMetrics, error) {
-	result := make([][]interface{}, len(rows))
+func (sc *SkyflowClient) Detokenize(ctx context.Context, rows []SfRow) ([]SfRow, *SkyflowMetrics, error) {
+	result := make([]SfRow, len(rows))
 	metrics := &SkyflowMetrics{TotalRows: len(rows)}
 
-	// Build dedup map: token → list of (origIdx, rowIndex)
+	// Build dedup map: token → list of original indices
 	type rowRef struct {
-		origIdx  int
-		rowIndex interface{}
+		origIdx int
+		rowNum  json.RawMessage
 	}
 	tokenMap := make(map[string][]rowRef, len(rows))
 	orderedTokens := make([]string, 0, len(rows))
 
 	for i, row := range rows {
-		if len(row) < 2 {
-			result[i] = []interface{}{i, "ERROR: missing value"}
+		token := row.Value
+		if token == "" {
+			result[i] = SfRow{RowNum: row.RowNum, Value: "ERROR: missing value"}
 			continue
-		}
-		token, ok := row[1].(string)
-		if !ok {
-			token = fmt.Sprintf("%v", row[1])
 		}
 		refs := tokenMap[token]
 		if len(refs) == 0 {
 			orderedTokens = append(orderedTokens, token)
 		}
-		tokenMap[token] = append(refs, rowRef{origIdx: i, rowIndex: row[0]})
+		tokenMap[token] = append(refs, rowRef{origIdx: i, rowNum: row.RowNum})
 	}
 
 	metrics.UniqueTokens = len(orderedTokens)
@@ -453,7 +450,7 @@ func (sc *SkyflowClient) Detokenize(ctx context.Context, rows [][]interface{}) (
 	for token, refs := range tokenMap {
 		val := valueMap[token]
 		for _, ref := range refs {
-			result[ref.origIdx] = []interface{}{ref.rowIndex, val}
+			result[ref.origIdx] = SfRow{RowNum: ref.rowNum, Value: val}
 		}
 	}
 
